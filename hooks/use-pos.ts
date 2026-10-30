@@ -1,7 +1,10 @@
 "use client";
 
 import type {
-  CashSessionListFilters,
+  CashDiscrepancyReportListParams,
+  CashRegisterMovementListParams,
+  CashRegisterListParams,
+  CashSessionListParams,
   PosItemsInput,
 } from "@/lib/validations/pos";
 
@@ -13,6 +16,9 @@ import {
   getCashSession,
   getPosSettingsAction,
   getPosState,
+  getCashRegister,
+  listCashDiscrepancyReports,
+  listCashRegisterMovements,
   listCashRegisters,
   listCashSessions,
   listHeldCarts,
@@ -48,10 +54,10 @@ export function usePosItems(params: PosItemsInput) {
   });
 }
 
-export function useCashSessions(filters: CashSessionListFilters) {
+export function useCashSessions(params: CashSessionListParams) {
   return useQuery({
-    queryKey: queryKeys.cashSessionList(filters),
-    queryFn: () => unwrapAction(listCashSessions(filters)),
+    queryKey: queryKeys.cashSessionList(params),
+    queryFn: () => unwrapAction(listCashSessions(params)),
     placeholderData: keepPreviousData,
   });
 }
@@ -64,10 +70,41 @@ export function useCashSession(id: string) {
   });
 }
 
-export function useCashRegisters() {
+export function useCashRegisters(params: CashRegisterListParams) {
   return useQuery({
-    queryKey: queryKeys.cashRegisters,
-    queryFn: () => unwrapAction(listCashRegisters()),
+    queryKey: queryKeys.cashRegisterList(params),
+    queryFn: () => unwrapAction(listCashRegisters(params)),
+    placeholderData: keepPreviousData,
+  });
+}
+
+export function useCashRegister(id: string) {
+  return useQuery({
+    queryKey: queryKeys.cashRegister(id),
+    queryFn: () => unwrapAction(getCashRegister(id)),
+    retry: false,
+  });
+}
+
+/** One page of the movements of a closed register. */
+export function useCashRegisterMovements(
+  params: CashRegisterMovementListParams,
+) {
+  return useQuery({
+    queryKey: queryKeys.cashRegisterMovements(params),
+    queryFn: () => unwrapAction(listCashRegisterMovements(params)),
+    placeholderData: keepPreviousData,
+  });
+}
+
+/** One page of the differences reported at the opening of a register. */
+export function useCashDiscrepancyReports(
+  params: CashDiscrepancyReportListParams,
+) {
+  return useQuery({
+    queryKey: queryKeys.cashDiscrepancyReports(params),
+    queryFn: () => unwrapAction(listCashDiscrepancyReports(params)),
+    placeholderData: keepPreviousData,
   });
 }
 

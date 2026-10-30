@@ -94,7 +94,15 @@ export const queryKeys = {
   posItems: (params: Record<string, unknown>) =>
     ["sales", "pos", "items", params] as const,
   cashRegisters: ["sales", "pos", "registers"] as const,
+  cashRegisterList: (params: Record<string, unknown>) =>
+    ["sales", "pos", "registers", "list", params] as const,
   cashRegisterOptions: ["sales", "pos", "registers", "options"] as const,
+  cashRegister: (id: string) =>
+    ["sales", "pos", "registers", "detail", id] as const,
+  cashRegisterMovements: (params: { registerId: string } & object) =>
+    ["sales", "pos", "registers", "movements", params] as const,
+  cashDiscrepancyReports: (params: { registerId: string } & object) =>
+    ["sales", "pos", "registers", "reports", params] as const,
   cashSessionList: (filters: Record<string, unknown>) =>
     ["sales", "pos", "sessions", "list", filters] as const,
   cashSession: (id: string) =>

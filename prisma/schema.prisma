@@ -21,22 +21,24 @@ model User {
   members     Member[]
   invitations Invitation[]
 
-  ownedCustomers     Customer[]             @relation("CustomerOwner")
-  createdCustomers   Customer[]             @relation("CustomerCreator")
-  customerNotes      CustomerNote[]
-  ownedLeads         Lead[]                 @relation("LeadOwner")
-  createdLeads       Lead[]                 @relation("LeadCreator")
-  leadNotes          LeadNote[]
-  createdProducts    Product[]              @relation("ProductCreator")
-  stockMovements     ProductStockMovement[]
-  createdServices    Service[]              @relation("ServiceCreator")
-  ownedSales         SalesDocument[]        @relation("SalesOwner")
-  createdSales       SalesDocument[]        @relation("SalesCreator")
-  salesPayments      SalesPayment[]
-  openedCashSessions CashSession[]          @relation("CashSessionOpener")
-  closedCashSessions CashSession[]          @relation("CashSessionCloser")
-  cashMovements      CashMovement[]
-  heldCarts          PosHeldCart[]
+  ownedCustomers         Customer[]              @relation("CustomerOwner")
+  createdCustomers       Customer[]              @relation("CustomerCreator")
+  customerNotes          CustomerNote[]
+  ownedLeads             Lead[]                  @relation("LeadOwner")
+  createdLeads           Lead[]                  @relation("LeadCreator")
+  leadNotes              LeadNote[]
+  createdProducts        Product[]               @relation("ProductCreator")
+  stockMovements         ProductStockMovement[]
+  createdServices        Service[]               @relation("ServiceCreator")
+  ownedSales             SalesDocument[]         @relation("SalesOwner")
+  createdSales           SalesDocument[]         @relation("SalesCreator")
+  salesPayments          SalesPayment[]
+  openedCashSessions     CashSession[]           @relation("CashSessionOpener")
+  closedCashSessions     CashSession[]           @relation("CashSessionCloser")
+  cashMovements          CashMovement[]
+  cashRegisterMovements  CashRegisterMovement[]
+  cashDiscrepancyReports CashDiscrepancyReport[]
+  heldCarts              PosHeldCart[]
 
   @@map("user")
 }
@@ -102,29 +104,31 @@ model Organization {
 
   roles OrganizationRole[]
 
-  customers            Customer[]
-  customerStatuses     CustomerStatus[]
-  customerNotes        CustomerNote[]
-  pipelines            Pipeline[]
-  pipelineStages       PipelineStage[]
-  leads                Lead[]
-  leadNotes            LeadNote[]
-  productCategories    ProductCategory[]
-  products             Product[]
-  stockMovements       ProductStockMovement[]
-  productPresentations ProductPresentation[]
-  productImages        ProductImage[]
-  serviceCategories    ServiceCategory[]
-  services             Service[]
-  salesDocuments       SalesDocument[]
-  salesDocumentLines   SalesDocumentLine[]
-  salesPayments        SalesPayment[]
-  salesCounters        SalesCounter[]
-  paymentMethods       PaymentMethod[]
-  cashRegisters        CashRegister[]
-  cashSessions         CashSession[]
-  cashMovements        CashMovement[]
-  posHeldCarts         PosHeldCart[]
+  customers              Customer[]
+  customerStatuses       CustomerStatus[]
+  customerNotes          CustomerNote[]
+  pipelines              Pipeline[]
+  pipelineStages         PipelineStage[]
+  leads                  Lead[]
+  leadNotes              LeadNote[]
+  productCategories      ProductCategory[]
+  products               Product[]
+  stockMovements         ProductStockMovement[]
+  productPresentations   ProductPresentation[]
+  productImages          ProductImage[]
+  serviceCategories      ServiceCategory[]
+  services               Service[]
+  salesDocuments         SalesDocument[]
+  salesDocumentLines     SalesDocumentLine[]
+  salesPayments          SalesPayment[]
+  salesCounters          SalesCounter[]
+  paymentMethods         PaymentMethod[]
+  cashRegisters          CashRegister[]
+  cashSessions           CashSession[]
+  cashMovements          CashMovement[]
+  cashRegisterMovements  CashRegisterMovement[]
+  cashDiscrepancyReports CashDiscrepancyReport[]
+  posHeldCarts           PosHeldCart[]
 
   /// ISO 4217 code used to show amounts (e.g. lead values). Edited from settings.
   currency String @default("EUR")
@@ -802,15 +806,20 @@ model PaymentMethod {
 
 /// A till of the point of sale, e.g. "Caja 1". Opened and closed in sessions.
 model CashRegister {
-  id             String        @id @default(cuid())
-  organizationId String
-  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  name           String
-  isActive       Boolean       @default(true)
-  createdAt      DateTime      @default(now())
-  updatedAt      DateTime      @updatedAt
-  sessions       CashSession[]
-  heldCarts      PosHeldCart[]
+  id                 String                  @id @default(cuid())
+  organizationId     String
+  organization       Organization            @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name               String
+  isActive           Boolean                 @default(true)
+  /// Cash the drawer holds while closed: what was left at the last closing
+  /// or set by an adjustment. The next opening must count this amount.
+  cashBalance        Decimal                 @default(0) @db.Decimal(14, 2)
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+  sessions           CashSession[]
+  heldCarts          PosHeldCart[]
+  movements          CashRegisterMovement[]
+  discrepancyReports CashDiscrepancyReport[]
 
   @@unique([organizationId, name])
   @@map("cash_register")
@@ -877,6 +886,56 @@ model CashMovement {
   @@index([sessionId, createdAt])
   @@index([organizationId])
   @@map("cash_movement")
+}
+
+enum CashRegisterMovementType {
+  IN
+  OUT
+  /// Sets the balance to the cash actually in the drawer.
+  ADJUSTMENT
+}
+
+/// Cash put in, taken out or adjusted in a closed register by someone with
+/// `pos:adjust`. While a register is open its cash moves in the session.
+model CashRegisterMovement {
+  id             String                   @id @default(cuid())
+  organizationId String
+  organization   Organization             @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  registerId     String
+  register       CashRegister             @relation(fields: [registerId], references: [id], onDelete: Cascade)
+  type           CashRegisterMovementType
+  /// Change of the balance: positive for entries, negative for withdrawals.
+  amount         Decimal                  @db.Decimal(14, 2)
+  balanceAfter   Decimal                  @db.Decimal(14, 2)
+  reason         String
+  authorId       String?
+  author         User?                    @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  createdAt      DateTime                 @default(now())
+
+  @@index([registerId, createdAt])
+  @@index([organizationId])
+  @@map("cash_register_movement")
+}
+
+/// A cashier counted another amount than the register's balance at opening.
+/// Informative: resolved by the next movement of the register or opening.
+model CashDiscrepancyReport {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  registerId     String
+  register       CashRegister @relation(fields: [registerId], references: [id], onDelete: Cascade)
+  expectedAmount Decimal      @db.Decimal(14, 2)
+  countedAmount  Decimal      @db.Decimal(14, 2)
+  reason         String
+  authorId       String?
+  author         User?        @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  resolvedAt     DateTime?
+  createdAt      DateTime     @default(now())
+
+  @@index([registerId, createdAt])
+  @@index([organizationId, resolvedAt])
+  @@map("cash_discrepancy_report")
 }
 
 /// Cart parked at the till to charge it later, from any register of the

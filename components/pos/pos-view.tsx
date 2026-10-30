@@ -39,6 +39,7 @@ import {
   CloseSessionModal,
   CollectInvoiceModal,
   LoadDocumentModal,
+  ReportDiscrepancyModal,
 } from "@/components/pos/pos-cash-modals";
 import { PosCatalog } from "@/components/pos/pos-catalog";
 import { PosCheckoutModal } from "@/components/pos/pos-checkout-modal";
@@ -55,6 +56,7 @@ import {
   AppInput,
   AppLink,
   AppTooltip,
+  notify,
 } from "@/components/ui";
 import { SALES_TYPES, salesItemHref } from "@/config/sales";
 import { useActionMutation } from "@/hooks/use-action-mutation";
@@ -77,14 +79,27 @@ const OPEN_FORM = "open-cash-session-form";
 const EMPTY_CART: PosCartValues = { customerId: "", sourceId: "", lines: [] };
 
 function OpenSessionCard() {
+  const money = useMoneyFormatter();
+  const [mismatch, setMismatch] = useState<
+    OpenCashSessionValues & { expected: number }
+  >();
+  const [isReportOpen, setIsReportOpen] = useState(false);
+  /** Register whose difference was just reported. */
+  const [reportedId, setReportedId] = useState<string>();
   const open = useActionMutation(openCashSession, {
-    successMessage: "Caja abierta",
     invalidate: [queryKeys.pos],
   });
   const { control, handleSubmit } = useForm<OpenCashSessionValues>({
     resolver: zodResolver(openCashSessionSchema),
-    defaultValues: { registerId: "", openingAmount: "" },
+    defaultValues: { registerId: "", countedCash: "" },
   });
+  const values = useWatch({ control });
+  const isMismatch =
+    mismatch?.registerId === values.registerId &&
+    mismatch?.countedCash === values.countedCash;
+  const difference = mismatch
+    ? typedNumber(mismatch.countedCash) - mismatch.expected
+    : 0;
 
   return (
     <div className="mx-auto flex w-full max-w-md flex-col gap-6 pt-6">
@@ -95,7 +110,7 @@ function OpenSessionCard() {
         <div className="flex flex-col gap-1">
           <h1 className="text-2xl font-semibold tracking-tight">Abrir caja</h1>
           <p className="text-muted">
-            Elige la caja y cuenta el efectivo con el que empiezas.
+            Elige la caja y cuenta el efectivo que hay en el cajón.
           </p>
         </div>
       </div>
@@ -104,7 +119,18 @@ function OpenSessionCard() {
           noValidate
           className="flex flex-col gap-4"
           id={OPEN_FORM}
-          onSubmit={handleSubmit((values) => open.mutate(values))}
+          onSubmit={handleSubmit((form) =>
+            open.mutate(form, {
+              onSuccess: (result) => {
+                if (result.opened) {
+                  setMismatch(undefined);
+                  notify.success("Caja abierta");
+                } else {
+                  setMismatch({ ...form, expected: result.expected });
+                }
+              },
+            }),
+          )}
         >
           {open.error ? (
             <AppAlert
@@ -123,26 +149,71 @@ function OpenSessionCard() {
           <AppInput
             isRequired
             control={control}
-            description="Efectivo que hay en el cajón al empezar."
+            description="Debe coincidir con el efectivo que quedó al cerrarla."
             inputMode="decimal"
-            label="Fondo inicial"
-            name="openingAmount"
+            label="Efectivo contado"
+            name="countedCash"
             placeholder="0"
           />
-          <AppButton
-            fullWidth
-            isPending={open.isPending}
-            size="lg"
-            type="submit"
-          >
-            Abrir caja
-          </AppButton>
+          {mismatch && isMismatch ? (
+            <AppAlert
+              description={
+                <>
+                  Esta caja debería tener {money.format(mismatch.expected)} y
+                  has contado {money.format(typedNumber(mismatch.countedCash))}{" "}
+                  ({difference > 0 ? "sobran" : "faltan"}{" "}
+                  {money.format(Math.abs(difference))}). Vuelve a contar o
+                  reporta la diferencia para que el administrador ajuste la
+                  caja.
+                </>
+              }
+              status="danger"
+              title="El efectivo no coincide"
+            />
+          ) : reportedId && reportedId === values.registerId ? (
+            <AppAlert
+              description="El administrador revisará la diferencia y ajustará el efectivo de la caja. Después podrás abrirla con lo que has contado."
+              status="accent"
+              title="Diferencia reportada"
+            />
+          ) : null}
+          {mismatch && isMismatch ? (
+            <AppButton
+              fullWidth
+              size="lg"
+              variant="secondary"
+              onPress={() => setIsReportOpen(true)}
+            >
+              Reportar diferencia
+            </AppButton>
+          ) : (
+            <AppButton
+              fullWidth
+              isPending={open.isPending}
+              size="lg"
+              type="submit"
+            >
+              Abrir caja
+            </AppButton>
+          )}
         </form>
       </AppCard>
       <p className="text-center text-sm text-muted">
         ¿Buscas un cierre anterior?{" "}
         <AppLink href="/pos/sessions">Ver aperturas de caja</AppLink>
       </p>
+      {mismatch ? (
+        <ReportDiscrepancyModal
+          countedCash={mismatch.countedCash}
+          isOpen={isReportOpen}
+          registerId={mismatch.registerId}
+          onOpenChange={setIsReportOpen}
+          onReported={() => {
+            setReportedId(mismatch.registerId);
+            setMismatch(undefined);
+          }}
+        />
+      ) : null}
     </div>
   );
 }

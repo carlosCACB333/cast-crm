@@ -1,9 +1,15 @@
 import { z } from "zod";
 
-import { CASH_MOVEMENT_TYPE_CODES, POS_LIMITS } from "@/config/pos";
+import {
+  CASH_DISCREPANCY_STATUS_CODES,
+  CASH_MOVEMENT_TYPE_CODES,
+  CASH_REGISTER_MOVEMENT_TYPE_CODES,
+  POS_LIMITS,
+} from "@/config/pos";
 import { SALES_LIMITS } from "@/config/sales";
 import { amountField, idField, optionalText } from "@/lib/validations/fields";
 import { salesLineSchema } from "@/lib/validations/sales";
+import { listQuerySchema } from "@/lib/validations/table";
 
 const positiveAmount = (message: string) =>
   amountField.refine(
@@ -13,6 +19,17 @@ const positiveAmount = (message: string) =>
 
 const requiredAmount = (message: string) =>
   amountField.refine((value) => value !== "", message);
+
+const typedAmount = (value: string) => Number(value.replace(",", "."));
+
+const reasonField = z
+  .string()
+  .trim()
+  .min(2, "Indica el motivo")
+  .max(
+    POS_LIMITS.maxReasonLength,
+    `Máximo ${POS_LIMITS.maxReasonLength} caracteres`,
+  );
 
 export const cashRegisterFormSchema = z.object({
   name: z
@@ -31,22 +48,76 @@ export const updateCashRegisterSchema = z.object({
   values: cashRegisterFormSchema,
 });
 
+/** The cash counted in the drawer must match the register's balance. */
 export const openCashSessionSchema = z.object({
   registerId: z.string().trim().min(1, "Selecciona una caja").max(128),
-  openingAmount: requiredAmount("Indica el efectivo con el que abres"),
+  countedCash: requiredAmount("Indica el efectivo que hay en el cajón"),
+});
+
+export const reportCashDiscrepancyFormSchema = z.object({
+  reason: reasonField,
+});
+
+/** The cashier counted another amount at opening and tells the admin. */
+export const reportCashDiscrepancySchema = openCashSessionSchema.extend(
+  reportCashDiscrepancyFormSchema.shape,
+);
+
+/**
+ * Movement of a closed register: entries and withdrawals move `amount`; an
+ * adjustment sets the balance to `amount`, the cash actually in the drawer.
+ */
+export const cashRegisterMovementFormSchema = z
+  .object({
+    type: z.enum(CASH_REGISTER_MOVEMENT_TYPE_CODES, "Selecciona el tipo"),
+    amount: requiredAmount("Indica el importe"),
+    reason: reasonField,
+  })
+  .superRefine((values, ctx) => {
+    if (
+      values.type !== "ADJUSTMENT" &&
+      values.amount &&
+      typedAmount(values.amount) <= 0
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["amount"],
+        message: "Indica un importe mayor que 0",
+      });
+    }
+  });
+
+export const addCashRegisterMovementSchema = z.object({
+  registerId: idField,
+  values: cashRegisterMovementFormSchema,
+});
+
+export const cashRegisterMovementListSchema = listQuerySchema(
+  ["createdAt", "amount"],
+  { sort: "createdAt", direction: "desc" },
+).extend({
+  registerId: idField,
+  /** Movement types to show; empty shows every type. */
+  types: z.array(z.enum(CASH_REGISTER_MOVEMENT_TYPE_CODES)).max(3).default([]),
+  /** Author user id; "" for anyone. */
+  authorId: z.string().trim().max(128).default(""),
+});
+
+export const cashDiscrepancyReportListSchema = listQuerySchema(["createdAt"], {
+  sort: "createdAt",
+  direction: "desc",
+}).extend({
+  registerId: idField,
+  /** "" shows every report. */
+  status: z.enum(["", ...CASH_DISCREPANCY_STATUS_CODES]).default(""),
+  /** Who reported it; "" for anyone. */
+  authorId: z.string().trim().max(128).default(""),
 });
 
 export const cashMovementFormSchema = z.object({
   type: z.enum(CASH_MOVEMENT_TYPE_CODES, "Selecciona el tipo"),
   amount: positiveAmount("Indica un importe mayor que 0"),
-  reason: z
-    .string()
-    .trim()
-    .min(2, "Indica el motivo")
-    .max(
-      POS_LIMITS.maxReasonLength,
-      `Máximo ${POS_LIMITS.maxReasonLength} caracteres`,
-    ),
+  reason: reasonField,
 });
 
 export const addCashMovementSchema = z.object({
@@ -54,10 +125,38 @@ export const addCashMovementSchema = z.object({
   values: cashMovementFormSchema,
 });
 
-export const closeCashSessionFormSchema = z.object({
-  countedCash: requiredAmount("Indica el efectivo contado"),
-  notes: optionalText(POS_LIMITS.maxClosingNotesLength),
-});
+/**
+ * Cash count at closing. With `withdraw`, `withdrawAmount` leaves the drawer
+ * as a cash movement of the session and the rest stays in the register.
+ */
+export const closeCashSessionFormSchema = z
+  .object({
+    countedCash: requiredAmount("Indica el efectivo contado"),
+    withdraw: z.boolean(),
+    withdrawAmount: amountField,
+    notes: optionalText(POS_LIMITS.maxClosingNotesLength),
+  })
+  .superRefine((values, ctx) => {
+    if (!values.withdraw) return;
+
+    const amount = values.withdrawAmount
+      ? typedAmount(values.withdrawAmount)
+      : 0;
+
+    if (amount <= 0) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["withdrawAmount"],
+        message: "Indica un importe mayor que 0",
+      });
+    } else if (values.countedCash && amount > typedAmount(values.countedCash)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["withdrawAmount"],
+        message: "No puedes retirar más de lo contado",
+      });
+    }
+  });
 
 export const closeCashSessionSchema = z.object({
   sessionId: idField,
@@ -134,11 +233,19 @@ export const posItemsSchema = z.object({
   page: z.coerce.number().int().min(1).max(1000).default(1),
 });
 
-export const cashSessionListSchema = z.object({
-  page: z.coerce.number().int().min(1).max(10_000).default(1),
+export const cashSessionListSchema = listQuerySchema(["openedAt", "closedAt"], {
+  sort: "openedAt",
+  direction: "desc",
+}).extend({
+  /** "" for every register. */
   registerId: z.string().trim().max(128).default(""),
   status: z.enum(["", "OPEN", "CLOSED"]).default(""),
 });
+
+export const cashRegisterListSchema = listQuerySchema(
+  ["name", "cashBalance", "sessionCount"],
+  { sort: "name", direction: "asc" },
+);
 
 const prefixField = z
   .string()
@@ -163,6 +270,18 @@ export const posSettingsSchema = z.object({
 
 export type CashRegisterFormValues = z.infer<typeof cashRegisterFormSchema>;
 export type OpenCashSessionValues = z.infer<typeof openCashSessionSchema>;
+export type ReportCashDiscrepancyFormValues = z.infer<
+  typeof reportCashDiscrepancyFormSchema
+>;
+export type CashRegisterMovementFormValues = z.infer<
+  typeof cashRegisterMovementFormSchema
+>;
+export type CashRegisterMovementListParams = z.infer<
+  typeof cashRegisterMovementListSchema
+>;
+export type CashDiscrepancyReportListParams = z.infer<
+  typeof cashDiscrepancyReportListSchema
+>;
 export type CashMovementFormValues = z.infer<typeof cashMovementFormSchema>;
 export type CloseCashSessionFormValues = z.infer<
   typeof closeCashSessionFormSchema
@@ -174,5 +293,6 @@ export type PosCheckoutFormValues = z.infer<typeof posCheckoutFormSchema>;
 export type CollectInvoiceFormValues = z.infer<typeof collectInvoiceFormSchema>;
 export type PosLoadSourceValues = z.infer<typeof posLoadSourceSchema>;
 export type PosItemsInput = z.input<typeof posItemsSchema>;
-export type CashSessionListFilters = z.output<typeof cashSessionListSchema>;
+export type CashSessionListParams = z.infer<typeof cashSessionListSchema>;
+export type CashRegisterListParams = z.infer<typeof cashRegisterListSchema>;
 export type PosSettingsValues = z.infer<typeof posSettingsSchema>;

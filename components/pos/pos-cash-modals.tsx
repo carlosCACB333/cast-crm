@@ -7,6 +7,7 @@ import type {
   CloseCashSessionFormValues,
   CollectInvoiceFormValues,
   PosLoadSourceValues,
+  ReportCashDiscrepancyFormValues,
 } from "@/lib/validations/pos";
 
 import { useState } from "react";
@@ -21,6 +22,7 @@ import {
   AppButton,
   AppInput,
   AppModal,
+  AppSwitch,
   AppTextarea,
 } from "@/components/ui";
 import { CASH_MOVEMENT_TYPES } from "@/config/pos";
@@ -33,6 +35,7 @@ import {
   collectInvoiceAtPos,
   getPosInvoiceBalance,
   getPosSourceDocument,
+  reportCashDiscrepancy,
 } from "@/lib/actions/pos";
 import { optionSources } from "@/lib/option-sources";
 import { decimalToText } from "@/lib/pricing";
@@ -43,6 +46,7 @@ import {
   closeCashSessionFormSchema,
   collectInvoiceFormSchema,
   posLoadSourceSchema,
+  reportCashDiscrepancyFormSchema,
 } from "@/lib/validations/pos";
 
 /** Figures of a session: what came in by method and the cash in the drawer. */
@@ -211,10 +215,21 @@ export function CloseSessionModal({
   });
   const { control, handleSubmit } = useForm<CloseCashSessionFormValues>({
     resolver: zodResolver(closeCashSessionFormSchema),
-    defaultValues: { countedCash: "", notes: "" },
+    defaultValues: {
+      countedCash: "",
+      withdraw: false,
+      withdrawAmount: "",
+      notes: "",
+    },
   });
-  const counted = useWatch({ control, name: "countedCash" });
+  const [counted, withdraw, withdrawAmount] = useWatch({
+    control,
+    name: ["countedCash", "withdraw", "withdrawAmount"],
+  });
   const difference = roundMoney(typedNumber(counted) - summary.expectedCash);
+  const left = roundMoney(
+    typedNumber(counted) - (withdraw ? typedNumber(withdrawAmount) : 0),
+  );
 
   return (
     <AppModal
@@ -284,10 +299,113 @@ export function CloseSessionModal({
                 : `Faltan ${money.format(-difference)}.`}
           </p>
         ) : null}
+        <AppSwitch
+          control={control}
+          description="Se anota como salida de efectivo de esta apertura. El resto queda en la caja para la próxima apertura."
+          label="Retirar efectivo"
+          name="withdraw"
+        />
+        {withdraw ? (
+          <AppInput
+            isRequired
+            control={control}
+            inputMode="decimal"
+            label="Efectivo a retirar"
+            name="withdrawAmount"
+          />
+        ) : null}
+        {counted ? (
+          <p className="flex justify-between gap-4 text-sm font-semibold">
+            <span>Queda en la caja</span>
+            <span className="tabular-nums">{money.format(left)}</span>
+          </p>
+        ) : null}
         <AppTextarea
           control={control}
           label="Notas del cierre"
           name="notes"
+          rows={3}
+        />
+      </form>
+    </AppModal>
+  );
+}
+
+const REPORT_FORM = "report-cash-discrepancy-form";
+
+/** Tells the admin that the drawer holds another amount than expected. */
+export function ReportDiscrepancyModal({
+  registerId,
+  countedCash,
+  isOpen,
+  onOpenChange,
+  onReported,
+}: {
+  registerId: string;
+  countedCash: string;
+  isOpen: boolean;
+  onOpenChange: (isOpen: boolean) => void;
+  onReported: () => void;
+}) {
+  const report = useActionMutation(reportCashDiscrepancy, {
+    successMessage: "Diferencia reportada al administrador",
+    invalidate: [queryKeys.pos],
+  });
+  const { control, handleSubmit } = useForm<ReportCashDiscrepancyFormValues>({
+    resolver: zodResolver(reportCashDiscrepancyFormSchema),
+    defaultValues: { reason: "" },
+  });
+
+  return (
+    <AppModal
+      description="Queda registrada en el historial de la caja para que alguien con permiso para ajustar el efectivo la revise."
+      footer={
+        <>
+          <AppButton variant="tertiary" onPress={() => onOpenChange(false)}>
+            Cancelar
+          </AppButton>
+          <AppButton
+            form={REPORT_FORM}
+            isPending={report.isPending}
+            type="submit"
+          >
+            Reportar
+          </AppButton>
+        </>
+      }
+      isOpen={isOpen}
+      title="Reportar diferencia"
+      onOpenChange={onOpenChange}
+    >
+      <form
+        noValidate
+        className="flex flex-col gap-4"
+        id={REPORT_FORM}
+        onSubmit={handleSubmit(({ reason }) =>
+          report.mutate(
+            { registerId, countedCash, reason },
+            {
+              onSuccess: () => {
+                onOpenChange(false);
+                onReported();
+              },
+            },
+          ),
+        )}
+      >
+        {report.error ? (
+          <AppAlert
+            description={report.error.message}
+            status="danger"
+            title="No se pudo reportar"
+          />
+        ) : null}
+        <AppTextarea
+          isRequired
+          control={control}
+          label="¿Qué has encontrado?"
+          name="reason"
+          placeholder="Por ejemplo: faltan dos billetes de 100 en el cajón"
           rows={3}
         />
       </form>

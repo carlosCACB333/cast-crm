@@ -2,7 +2,6 @@
 
 import type { CashSessionRow } from "@/lib/actions/pos";
 
-import { useState } from "react";
 import { useRouter } from "next/navigation";
 import clsx from "clsx";
 
@@ -10,18 +9,22 @@ import { StoreIcon } from "@/components/icons";
 import { QueryError } from "@/components/organization/query-state";
 import { PageHeader } from "@/components/page-header";
 import {
+  AppDataTable,
   AppEmptyState,
-  AppFilterAutocomplete,
-  AppPagination,
   AppStatusChip,
-  AppTable,
+  type AppTableColumn,
 } from "@/components/ui";
 import { CASH_SESSION_STATUSES, cashSessionStatusInfo } from "@/config/pos";
+import { useListParams } from "@/hooks/use-list-params";
 import { useMyAccess, usePermission } from "@/hooks/use-organization";
 import { useCashSessions } from "@/hooks/use-pos";
 import { useMoneyFormatter } from "@/hooks/use-preferences";
 import { formatDateTime } from "@/lib/format";
 import { optionSources } from "@/lib/option-sources";
+import {
+  type CashSessionListParams,
+  cashSessionListSchema,
+} from "@/lib/validations/pos";
 
 type Column =
   | "register"
@@ -32,11 +35,11 @@ type Column =
   | "expected"
   | "difference";
 
-const COLUMNS: { key: Column; label: string }[] = [
-  { key: "register", label: "Caja" },
+const COLUMNS: AppTableColumn<Column>[] = [
+  { key: "register", label: "Caja", isRowHeader: true },
   { key: "status", label: "Estado" },
-  { key: "openedAt", label: "Apertura" },
-  { key: "closedAt", label: "Cierre" },
+  { key: "openedAt", label: "Apertura", allowsSorting: true },
+  { key: "closedAt", label: "Cierre", allowsSorting: true },
   { key: "tickets", label: "Tickets" },
   { key: "expected", label: "Efectivo esperado" },
   { key: "difference", label: "Descuadre" },
@@ -48,10 +51,10 @@ export function CashSessionsView() {
   const money = useMoneyFormatter();
   const access = useMyAccess();
   const canRead = usePermission({ pos: ["read"] });
-  const [registerId, setRegisterId] = useState("");
-  const [status, setStatus] = useState<"" | "OPEN" | "CLOSED">("");
-  const [page, setPage] = useState(1);
-  const sessions = useCashSessions({ page, registerId, status });
+  const list = useListParams<CashSessionListParams>(
+    cashSessionListSchema.parse({}),
+  );
+  const sessions = useCashSessions(list.params);
   const data = sessions.data;
 
   if (access.data && !canRead) {
@@ -118,64 +121,58 @@ export function CashSessionsView() {
         description="Cada apertura de caja con sus ventas, su arqueo y el descuadre al cerrar."
         title="Aperturas de caja"
       />
-      <div className="flex flex-col gap-3 sm:flex-row">
-        <AppFilterAutocomplete
-          className="sm:w-64"
-          label="Caja"
-          options={[{ value: "", label: "Todas las cajas" }]}
-          source={optionSources.cashRegisters}
-          value={registerId}
-          onChange={(value) => {
-            setRegisterId(value);
-            setPage(1);
-          }}
-        />
-        <AppFilterAutocomplete
-          className="sm:w-48"
-          label="Estado"
-          options={[
-            { value: "", label: "Todas" },
-            ...CASH_SESSION_STATUSES.map((item) => ({
-              value: item.status,
-              label: item.label,
-            })),
-          ]}
-          value={status}
-          onChange={(value) => {
-            setStatus(value as typeof status);
-            setPage(1);
-          }}
-        />
-      </div>
       {sessions.error ? (
         <QueryError error={sessions.error} onRetry={() => sessions.refetch()} />
       ) : (
-        <>
-          <AppTable
-            columns={COLUMNS}
-            emptyContent={
-              <AppEmptyState
-                description="Abre una caja desde el punto de venta para empezar a vender."
-                icon={<StoreIcon size={20} />}
-                title="Sin aperturas de caja"
-              />
-            }
-            getRowKey={(row) => row.id}
-            isLoading={!data || sessions.isPlaceholderData}
-            label="Aperturas de caja"
-            renderCell={renderCell}
-            rows={data?.items ?? []}
-            onRowAction={(id) => router.push(`/pos/sessions/${id}`)}
-          />
-          {data && data.pageCount > 1 ? (
-            <AppPagination
-              page={data.page}
-              pageCount={data.pageCount}
-              summary={`${data.total} aperturas`}
-              onChange={setPage}
+        <AppDataTable<CashSessionRow, Column>
+          columns={COLUMNS}
+          emptyContent={
+            <AppEmptyState
+              description="Abre una caja desde el punto de venta para empezar a vender."
+              icon={<StoreIcon size={20} />}
+              title="Sin aperturas de caja"
             />
-          ) : null}
-        </>
+          }
+          filters={[
+            {
+              type: "options",
+              label: "Caja",
+              allLabel: "Todas las cajas",
+              source: optionSources.cashRegisters,
+              value: list.params.registerId ? [list.params.registerId] : [],
+              onChange: (value) =>
+                list.setParams({ registerId: value[0] ?? "" }),
+            },
+            {
+              type: "options",
+              label: "Estado",
+              allLabel: "Todas",
+              options: CASH_SESSION_STATUSES.map((item) => ({
+                value: item.status,
+                label: item.label,
+              })),
+              value: list.params.status ? [list.params.status] : [],
+              onChange: (value) =>
+                list.setParams({
+                  status: (value[0] ?? "") as CashSessionListParams["status"],
+                }),
+            },
+          ]}
+          getRowKey={(row) => row.id}
+          label="Aperturas de caja"
+          pagination={list.pagination(data)}
+          query={sessions}
+          renderCell={renderCell}
+          rows={data?.items ?? []}
+          search={{
+            ...list.search,
+            placeholder: "Buscar por caja, persona o notas…",
+          }}
+          sort={list.sort}
+          onClearFilters={list.onClearFilters}
+          onRowAction={(id) => router.push(`/pos/sessions/${id}`)}
+          onSortChange={list.onSortChange}
+        />
       )}
     </div>
   );

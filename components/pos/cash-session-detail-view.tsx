@@ -124,7 +124,7 @@ export function CashSessionDetailView({ id }: { id: string }) {
           hint={
             data.countedCash === null
               ? "Se calcula al cerrar la caja"
-              : `Contado ${money.format(data.countedCash)}`
+              : `Quedó en caja ${money.format(data.countedCash)}`
           }
           icon={<StoreIcon size={18} />}
           label="Descuadre"

@@ -1,7 +1,12 @@
 "use server";
 
 import type { SalesDocumentType, SalesStatus } from "@/config/sales";
-import type { PosCartValues } from "@/lib/validations/pos";
+import type {
+  CashDiscrepancyReportListParams,
+  CashRegisterMovementListParams,
+  CashSessionListParams,
+  PosCartValues,
+} from "@/lib/validations/pos";
 
 import { APIError } from "better-auth/api";
 import { z } from "zod";
@@ -13,6 +18,7 @@ import {
   unitInfo as productUnitInfo,
 } from "@/config/products";
 import {
+  CASH_CLOSING_WITHDRAWAL_REASON,
   POS_LIMITS,
   POS_LOADABLE_STATUSES,
   POS_TICKET_SERIES,
@@ -24,9 +30,11 @@ import {
   findOperableSession,
   getCashSessionSummary,
   getPosSettings,
+  lockCashRegister,
   lockOpenCashSession,
 } from "@/lib/pos";
 import { includesPermissions } from "@/lib/permissions";
+import { type Page, pageWindow, paginateInMemory } from "@/lib/pagination";
 import { decimalToText } from "@/lib/pricing";
 import { prisma } from "@/lib/prisma";
 import {
@@ -51,7 +59,11 @@ import {
 import { storedLinePresentation } from "@/lib/validations/sales";
 import {
   addCashMovementSchema,
+  addCashRegisterMovementSchema,
+  cashDiscrepancyReportListSchema,
   cashRegisterFormSchema,
+  cashRegisterListSchema,
+  cashRegisterMovementListSchema,
   cashSessionListSchema,
   closeCashSessionSchema,
   collectInvoiceFormSchema,
@@ -61,6 +73,7 @@ import {
   posCartSchema,
   posItemsSchema,
   posSettingsSchema,
+  reportCashDiscrepancySchema,
   updateCashRegisterSchema,
 } from "@/lib/validations/pos";
 
@@ -949,23 +962,36 @@ export async function getPosInvoiceBalance(
 }
 
 /** Opens a register for the caller, with the cash in the drawer. */
+export type OpenCashSessionResult =
+  | { opened: true; id: string }
+  /** The cash counted is not the register's balance; nothing was opened. */
+  | { opened: false; expected: number; counted: number };
+
+/**
+ * Opens a register with the cash counted in its drawer, which must match the
+ * balance it was left with. Otherwise the cashier reports the difference and
+ * someone with `pos:adjust` corrects the balance.
+ */
 export async function openCashSession(
   input: unknown,
-): Promise<ActionResult<{ id: string }>> {
+): Promise<ActionResult<OpenCashSessionResult>> {
   return runAction(
     openCashSessionSchema,
     input,
-    async ({ registerId, openingAmount }) => {
+    async ({ registerId, countedCash }) => {
       const { organizationId, session } = await requirePermission({
         pos: ["sell"],
       });
 
       return withOpenSessionConstraint(() =>
-        prisma.$transaction(async (tx) => {
+        prisma.$transaction(async (tx): Promise<OpenCashSessionResult> => {
+          await lockCashRegister(tx, organizationId, registerId);
+
           const register = await tx.cashRegister.findFirst({
             where: { id: registerId, organizationId, isActive: true },
             select: {
               id: true,
+              cashBalance: true,
               _count: { select: { sessions: { where: { status: "OPEN" } } } },
             },
           });
@@ -989,17 +1015,174 @@ export async function openCashSession(
             throw new APIError("CONFLICT", { code: "CASH_REGISTER_IN_USE" });
           }
 
-          return tx.cashSession.create({
+          const expected = register.cashBalance.toNumber();
+          const counted = Number(toDecimal(countedCash));
+
+          if (counted !== expected) return { opened: false, expected, counted };
+
+          const created = await tx.cashSession.create({
             data: {
               organizationId,
               registerId,
               openedById: session.user.id,
-              openingAmount: Number(toDecimal(openingAmount)),
+              openingAmount: register.cashBalance,
             },
             select: { id: true },
           });
+
+          // The drawer matches again: earlier reports no longer apply.
+          await tx.cashDiscrepancyReport.updateMany({
+            where: { organizationId, registerId, resolvedAt: null },
+            data: { resolvedAt: new Date() },
+          });
+
+          return { opened: true, id: created.id };
         }),
       );
+    },
+  );
+}
+
+/**
+ * Records that the cashier found another amount than the register's balance,
+ * so someone with `pos:adjust` can review it and register a movement.
+ */
+export async function reportCashDiscrepancy(
+  input: unknown,
+): Promise<ActionResult> {
+  return runAction(
+    reportCashDiscrepancySchema,
+    input,
+    async ({ registerId, countedCash, reason }) => {
+      const { organizationId, session } = await requirePermission({
+        pos: ["sell"],
+      });
+
+      await prisma.$transaction(async (tx) => {
+        await lockCashRegister(tx, organizationId, registerId);
+
+        const register = await tx.cashRegister.findFirst({
+          where: { id: registerId, organizationId, isActive: true },
+          select: {
+            cashBalance: true,
+            _count: { select: { sessions: { where: { status: "OPEN" } } } },
+          },
+        });
+
+        if (!register) {
+          throw new APIError("BAD_REQUEST", { code: "INVALID_CASH_REGISTER" });
+        }
+        if (register._count.sessions > 0) {
+          throw new APIError("CONFLICT", { code: "CASH_REGISTER_IN_USE" });
+        }
+
+        const counted = Number(toDecimal(countedCash));
+
+        if (counted === register.cashBalance.toNumber()) {
+          throw new APIError("BAD_REQUEST", { code: "CASH_OPENING_MATCHES" });
+        }
+
+        await tx.cashDiscrepancyReport.create({
+          data: {
+            organizationId,
+            registerId,
+            expectedAmount: register.cashBalance,
+            countedAmount: counted,
+            reason,
+            authorId: session.user.id,
+          },
+        });
+      });
+
+      return undefined;
+    },
+  );
+}
+
+/**
+ * Puts cash in, takes it out or adjusts the balance of a closed register
+ * (an open one moves its cash in the session). Requires `pos:adjust` and
+ * resolves the register's pending reported differences.
+ */
+export async function addCashRegisterMovement(
+  input: unknown,
+): Promise<ActionResult> {
+  return runAction(
+    addCashRegisterMovementSchema,
+    input,
+    async ({ registerId, values }) => {
+      const { organizationId, session } = await requirePermission({
+        pos: ["adjust"],
+      });
+
+      await prisma.$transaction(async (tx) => {
+        await lockCashRegister(tx, organizationId, registerId);
+
+        const register = await tx.cashRegister.findFirst({
+          where: { id: registerId, organizationId },
+          select: {
+            cashBalance: true,
+            _count: {
+              select: {
+                sessions: { where: { status: "OPEN" } },
+                discrepancyReports: { where: { resolvedAt: null } },
+              },
+            },
+          },
+        });
+
+        if (!register) {
+          throw new APIError("NOT_FOUND", { code: "INVALID_CASH_REGISTER" });
+        }
+        if (register._count.sessions > 0) {
+          throw new APIError("BAD_REQUEST", {
+            code: "CASH_REGISTER_OPEN_ADJUST",
+          });
+        }
+
+        const balance = register.cashBalance.toNumber();
+        const typed = Number(toDecimal(values.amount));
+        const balanceAfter =
+          values.type === "ADJUSTMENT"
+            ? typed
+            : roundMoney(balance + (values.type === "IN" ? typed : -typed));
+
+        if (balanceAfter < 0) {
+          throw new APIError("BAD_REQUEST", { code: "CASH_NOT_ENOUGH" });
+        }
+        if (
+          values.type === "ADJUSTMENT" &&
+          balanceAfter === balance &&
+          register._count.discrepancyReports === 0
+        ) {
+          throw new APIError("BAD_REQUEST", { code: "CASH_BALANCE_UNCHANGED" });
+        }
+
+        const now = new Date();
+
+        await tx.cashRegister.update({
+          where: { id: registerId },
+          data: { cashBalance: balanceAfter },
+        });
+        await tx.cashRegisterMovement.create({
+          data: {
+            organizationId,
+            registerId,
+            type: values.type,
+            amount: roundMoney(balanceAfter - balance),
+            balanceAfter,
+            reason: values.reason,
+            authorId: session.user.id,
+            createdAt: now,
+          },
+        });
+        await tx.cashDiscrepancyReport.updateMany({
+          where: { organizationId, registerId, resolvedAt: null },
+          data: { resolvedAt: now },
+        });
+      });
+
+      return undefined;
     },
   );
 }
@@ -1053,8 +1236,10 @@ export async function addCashMovement(input: unknown): Promise<ActionResult> {
 }
 
 /**
- * Closes a session with the cash counted: stores what should have been in
- * the drawer and the difference. Its tickets and payments are locked after.
+ * Closes a session with the cash counted: an optional withdrawal leaves the
+ * drawer as a cash movement of the session, then it stores what should have
+ * remained, what remained and the difference. The register keeps what
+ * remained. Its tickets and payments are locked after.
  */
 export async function closeCashSession(input: unknown): Promise<ActionResult> {
   return runAction(
@@ -1078,15 +1263,27 @@ export async function closeCashSession(input: unknown): Promise<ActionResult> {
           cashSession,
         );
         const countedCash = Number(toDecimal(values.countedCash));
+        const withdrawn = values.withdraw
+          ? Number(toDecimal(values.withdrawAmount))
+          : 0;
+
+        if (withdrawn > countedCash) {
+          throw new APIError("BAD_REQUEST", {
+            code: "CASH_WITHDRAWAL_TOO_HIGH",
+          });
+        }
+
+        const expectedLeft = roundMoney(expectedCash - withdrawn);
+        const left = roundMoney(countedCash - withdrawn);
         const { count } = await tx.cashSession.updateMany({
           where: { id: sessionId, organizationId, status: "OPEN" },
           data: {
             status: "CLOSED",
             closedById: session.user.id,
             closedAt: new Date(),
-            expectedCash,
-            countedCash,
-            difference: roundMoney(countedCash - expectedCash),
+            expectedCash: expectedLeft,
+            countedCash: left,
+            difference: roundMoney(left - expectedLeft),
             closingNotes: emptyToNull(values.notes),
           },
         });
@@ -1094,6 +1291,24 @@ export async function closeCashSession(input: unknown): Promise<ActionResult> {
         if (count === 0) {
           throw new APIError("CONFLICT", { code: "CASH_SESSION_CLOSED" });
         }
+        if (withdrawn > 0) {
+          await tx.cashMovement.create({
+            data: {
+              organizationId,
+              sessionId,
+              type: "OUT",
+              amount: withdrawn,
+              reason: CASH_CLOSING_WITHDRAWAL_REASON,
+              authorId: session.user.id,
+            },
+          });
+        }
+
+        await lockCashRegister(tx, organizationId, cashSession.registerId);
+        await tx.cashRegister.update({
+          where: { id: cashSession.registerId },
+          data: { cashBalance: left },
+        });
       });
 
       return undefined;
@@ -1142,31 +1357,46 @@ function serializeSessionRow({
 
 async function findCashSessions(
   organizationId: string,
-  filters: z.output<typeof cashSessionListSchema>,
+  { q, registerId, status, sort, direction, page }: CashSessionListParams,
 ) {
   const where: Prisma.CashSessionWhereInput = { organizationId };
 
-  if (filters.registerId) where.registerId = filters.registerId;
-  if (filters.status) where.status = filters.status;
+  if (registerId) where.registerId = registerId;
+  if (status) where.status = status;
+  if (q) {
+    const contains = { contains: q, mode: "insensitive" } as const;
 
-  const pageSize = POS_LIMITS.sessionsPageSize;
-  const [items, total] = await prisma.$transaction([
-    prisma.cashSession.findMany({
-      where,
-      orderBy: [{ openedAt: "desc" }, { id: "asc" }],
-      skip: (filters.page - 1) * pageSize,
-      take: pageSize,
-      select: sessionRowSelect,
-    }),
-    prisma.cashSession.count({ where }),
-  ]);
+    where.OR = [
+      { register: { name: contains } },
+      { openedBy: { name: contains } },
+      { closedBy: { name: contains } },
+      { closingNotes: contains },
+    ];
+  }
+
+  const total = await prisma.cashSession.count({ where });
+  const window = pageWindow(page, POS_LIMITS.sessionsPageSize, total);
+  const items = await prisma.cashSession.findMany({
+    where,
+    // Open sessions have no closing date; they go last either way. `nulls`
+    // is only accepted on optional fields.
+    orderBy: [
+      sort === "closedAt"
+        ? { closedAt: { sort: direction, nulls: "last" } }
+        : { openedAt: direction },
+      { id: "desc" },
+    ],
+    skip: window.skip,
+    take: window.take,
+    select: sessionRowSelect,
+  });
 
   return {
     items: items.map(serializeSessionRow),
     total,
-    page: filters.page,
-    pageSize,
-    pageCount: Math.max(1, Math.ceil(total / pageSize)),
+    page: window.page,
+    pageSize: window.pageSize,
+    pageCount: window.pageCount,
   };
 }
 
@@ -1294,15 +1524,26 @@ export async function getCashSession(
   });
 }
 
-async function findCashRegisters(organizationId: string) {
+export type CashRegisterItem = Awaited<
+  ReturnType<typeof findCashRegisters>
+>[number];
+
+async function findCashRegisters(organizationId: string, id?: string) {
   const registers = await prisma.cashRegister.findMany({
-    where: { organizationId },
+    where: { organizationId, ...(id ? { id } : {}) },
     orderBy: [{ name: "asc" }, { id: "asc" }],
     select: {
       id: true,
       name: true,
       isActive: true,
-      _count: { select: { sessions: true } },
+      cashBalance: true,
+      _count: {
+        select: {
+          sessions: true,
+          movements: true,
+          discrepancyReports: { where: { resolvedAt: null } },
+        },
+      },
       sessions: {
         where: { status: "OPEN" },
         select: { id: true, openedAt: true, openedBy: { select: userSelect } },
@@ -1310,26 +1551,248 @@ async function findCashRegisters(organizationId: string) {
     },
   });
 
-  return registers.map(({ _count, sessions, ...register }) => ({
+  return registers.map(({ _count, sessions, cashBalance, ...register }) => ({
     ...register,
+    cashBalance: cashBalance.toNumber(),
     sessionCount: _count.sessions,
+    movementCount: _count.movements,
+    pendingDiscrepancies: _count.discrepancyReports,
     openSession: sessions[0]
       ? { ...sessions[0], openedAt: sessions[0].openedAt.toISOString() }
       : null,
   }));
 }
 
-export type CashRegisterItem = Awaited<
-  ReturnType<typeof findCashRegisters>
->[number];
-
-export async function listCashRegisters(): Promise<
-  ActionResult<CashRegisterItem[]>
+/**
+ * One page of the registers, searched and sorted on the server. Registers
+ * have a hard limit, so the page is cut in memory. Also returns how many
+ * exist and the ones with pending reported differences, whatever the search.
+ */
+export async function listCashRegisters(input: unknown): Promise<
+  ActionResult<
+    Page<CashRegisterItem> & {
+      registerCount: number;
+      withDiscrepancies: { id: string; name: string }[];
+    }
+  >
 > {
-  return runAction(z.undefined(), undefined, async () => {
+  return runAction(cashRegisterListSchema, input, async (params) => {
+    const { organizationId } = await requirePermission({ pos: ["read"] });
+    const registers = await findCashRegisters(organizationId);
+    const page = paginateInMemory(registers, {
+      q: params.q,
+      searchText: (register) => [
+        register.name,
+        register.openSession?.openedBy?.name,
+      ],
+      sortValue: (register) => register[params.sort],
+      direction: params.direction,
+      page: params.page,
+      pageSize: POS_LIMITS.registersPageSize,
+    });
+
+    return {
+      ...page,
+      registerCount: registers.length,
+      withDiscrepancies: registers
+        .filter((register) => register.pendingDiscrepancies > 0)
+        .map(({ id, name }) => ({ id, name })),
+    };
+  });
+}
+
+/** A register with its balance, who has it open and its pending reports. */
+export async function getCashRegister(
+  id: unknown,
+): Promise<ActionResult<CashRegisterItem>> {
+  return runAction(idField, id, async (registerId) => {
+    const { organizationId } = await requirePermission({ pos: ["read"] });
+    const [register] = await findCashRegisters(organizationId, registerId);
+
+    if (!register) {
+      throw new APIError("NOT_FOUND", { code: "INVALID_CASH_REGISTER" });
+    }
+
+    return register;
+  });
+}
+
+async function assertRegisterInOrganization(
+  organizationId: string,
+  registerId: string,
+) {
+  const count = await prisma.cashRegister.count({
+    where: { id: registerId, organizationId },
+  });
+
+  if (count === 0) {
+    throw new APIError("NOT_FOUND", { code: "INVALID_CASH_REGISTER" });
+  }
+}
+
+async function findCashRegisterMovements(
+  organizationId: string,
+  {
+    registerId,
+    q,
+    types,
+    authorId,
+    sort,
+    direction,
+    page,
+  }: CashRegisterMovementListParams,
+) {
+  const where: Prisma.CashRegisterMovementWhereInput = {
+    organizationId,
+    registerId,
+  };
+
+  if (types.length) where.type = { in: types };
+  if (authorId) where.authorId = authorId;
+  if (q) {
+    const contains = { contains: q, mode: "insensitive" } as const;
+
+    where.OR = [{ reason: contains }, { author: { name: contains } }];
+  }
+
+  const total = await prisma.cashRegisterMovement.count({ where });
+  const window = pageWindow(page, POS_LIMITS.registerHistoryPageSize, total);
+  const movements = await prisma.cashRegisterMovement.findMany({
+    where,
+    // The id keeps the order stable when values are equal.
+    orderBy: [{ [sort]: direction }, { id: "desc" }],
+    skip: window.skip,
+    take: window.take,
+    select: {
+      id: true,
+      type: true,
+      amount: true,
+      balanceAfter: true,
+      reason: true,
+      createdAt: true,
+      author: { select: userSelect },
+    },
+  });
+
+  return {
+    items: movements.map((movement) => ({
+      ...movement,
+      amount: movement.amount.toNumber(),
+      balanceAfter: movement.balanceAfter.toNumber(),
+      createdAt: movement.createdAt.toISOString(),
+    })),
+    total,
+    page: window.page,
+    pageSize: window.pageSize,
+    pageCount: window.pageCount,
+  };
+}
+
+export type CashRegisterMovementPage = Awaited<
+  ReturnType<typeof findCashRegisterMovements>
+>;
+export type CashRegisterMovementItem =
+  CashRegisterMovementPage["items"][number];
+
+/** One page of the movements of a register. */
+export async function listCashRegisterMovements(
+  input: unknown,
+): Promise<ActionResult<CashRegisterMovementPage>> {
+  return runAction(cashRegisterMovementListSchema, input, async (params) => {
     const { organizationId } = await requirePermission({ pos: ["read"] });
 
-    return findCashRegisters(organizationId);
+    await assertRegisterInOrganization(organizationId, params.registerId);
+
+    return findCashRegisterMovements(organizationId, params);
+  });
+}
+
+async function findCashDiscrepancyReports(
+  organizationId: string,
+  {
+    registerId,
+    q,
+    status,
+    authorId,
+    sort,
+    direction,
+    page,
+  }: CashDiscrepancyReportListParams,
+) {
+  const where: Prisma.CashDiscrepancyReportWhereInput = {
+    organizationId,
+    registerId,
+  };
+
+  if (status === "PENDING") where.resolvedAt = null;
+  if (status === "RESOLVED") where.resolvedAt = { not: null };
+  if (authorId) where.authorId = authorId;
+  if (q) {
+    const contains = { contains: q, mode: "insensitive" } as const;
+
+    where.OR = [{ reason: contains }, { author: { name: contains } }];
+  }
+
+  const total = await prisma.cashDiscrepancyReport.count({ where });
+  const window = pageWindow(page, POS_LIMITS.registerHistoryPageSize, total);
+  const reports = await prisma.cashDiscrepancyReport.findMany({
+    where,
+    orderBy: [{ [sort]: direction }, { id: "desc" }],
+    skip: window.skip,
+    take: window.take,
+    select: {
+      id: true,
+      expectedAmount: true,
+      countedAmount: true,
+      reason: true,
+      resolvedAt: true,
+      createdAt: true,
+      author: { select: userSelect },
+    },
+  });
+
+  return {
+    items: reports.map(
+      ({
+        expectedAmount,
+        countedAmount,
+        resolvedAt,
+        createdAt,
+        ...report
+      }) => ({
+        ...report,
+        expectedAmount: expectedAmount.toNumber(),
+        countedAmount: countedAmount.toNumber(),
+        difference: roundMoney(
+          countedAmount.toNumber() - expectedAmount.toNumber(),
+        ),
+        resolvedAt: resolvedAt?.toISOString() ?? null,
+        createdAt: createdAt.toISOString(),
+      }),
+    ),
+    total,
+    page: window.page,
+    pageSize: window.pageSize,
+    pageCount: window.pageCount,
+  };
+}
+
+export type CashDiscrepancyReportPage = Awaited<
+  ReturnType<typeof findCashDiscrepancyReports>
+>;
+export type CashDiscrepancyReportItem =
+  CashDiscrepancyReportPage["items"][number];
+
+/** One page of the differences reported at the opening of a register. */
+export async function listCashDiscrepancyReports(
+  input: unknown,
+): Promise<ActionResult<CashDiscrepancyReportPage>> {
+  return runAction(cashDiscrepancyReportListSchema, input, async (params) => {
+    const { organizationId } = await requirePermission({ pos: ["read"] });
+
+    await assertRegisterInOrganization(organizationId, params.registerId);
+
+    return findCashDiscrepancyReports(organizationId, params);
   });
 }
 
@@ -1399,7 +1862,10 @@ export async function updateCashRegister(
   });
 }
 
-/** Only registers never opened can be deleted; the others are deactivated. */
+/**
+ * Only registers never opened nor moved can be deleted; the others are
+ * deactivated so their history stays.
+ */
 export async function deleteCashRegister(id: unknown): Promise<ActionResult> {
   return runAction(idField, id, async (registerId) => {
     const { organizationId } = await requirePermission({ pos: ["manage"] });
@@ -1407,7 +1873,9 @@ export async function deleteCashRegister(id: unknown): Promise<ActionResult> {
     await prisma.$transaction(async (tx) => {
       const register = await tx.cashRegister.findFirst({
         where: { id: registerId, organizationId },
-        select: { _count: { select: { sessions: true } } },
+        select: {
+          _count: { select: { sessions: true, movements: true } },
+        },
       });
 
       if (!register) {
@@ -1416,6 +1884,11 @@ export async function deleteCashRegister(id: unknown): Promise<ActionResult> {
       if (register._count.sessions > 0) {
         throw new APIError("BAD_REQUEST", {
           code: "CASH_REGISTER_HAS_SESSIONS",
+        });
+      }
+      if (register._count.movements > 0) {
+        throw new APIError("BAD_REQUEST", {
+          code: "CASH_REGISTER_HAS_MOVEMENTS",
         });
       }
 

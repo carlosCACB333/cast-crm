@@ -31,6 +31,41 @@ export const CASH_MOVEMENT_TYPE_CODES = CASH_MOVEMENT_TYPES.map(
 export const cashMovementLabel = (type: string) =>
   CASH_MOVEMENT_TYPES.find((item) => item.type === type)?.short ?? type;
 
+/** Reason of the cash movement that takes the withdrawal out at closing. */
+export const CASH_CLOSING_WITHDRAWAL_REASON = "Retiro al cierre de caja";
+
+/** Movements of a closed register; `pos:adjust` registers them. */
+export const CASH_REGISTER_MOVEMENT_TYPES = [
+  { type: "IN", label: "Ingreso" },
+  { type: "OUT", label: "Salida" },
+  { type: "ADJUSTMENT", label: "Ajuste" },
+] as const;
+
+export type CashRegisterMovementType =
+  (typeof CASH_REGISTER_MOVEMENT_TYPES)[number]["type"];
+
+export const CASH_REGISTER_MOVEMENT_TYPE_CODES =
+  CASH_REGISTER_MOVEMENT_TYPES.map((item) => item.type) as unknown as readonly [
+    CashRegisterMovementType,
+    ...CashRegisterMovementType[],
+  ];
+
+export const cashRegisterMovementLabel = (type: string) =>
+  CASH_REGISTER_MOVEMENT_TYPES.find((item) => item.type === type)?.label ??
+  type;
+
+export const CASH_DISCREPANCY_STATUSES = [
+  { status: "PENDING", label: "Pendiente" },
+  { status: "RESOLVED", label: "Resuelta" },
+] as const;
+
+export type CashDiscrepancyStatus =
+  (typeof CASH_DISCREPANCY_STATUSES)[number]["status"];
+
+export const CASH_DISCREPANCY_STATUS_CODES = CASH_DISCREPANCY_STATUSES.map(
+  (item) => item.status,
+) as unknown as readonly [CashDiscrepancyStatus, ...CashDiscrepancyStatus[]];
+
 export const CASH_SESSION_STATUSES = [
   { status: "OPEN", label: "Abierta", color: "#22c55e" },
   { status: "CLOSED", label: "Cerrada", color: "#71717a" },
@@ -59,9 +94,12 @@ export const POS_LIMITS = {
   maxClosingNotesLength: 1000,
   maxWalkInNameLength: 80,
   sessionsPageSize: 20,
+  registersPageSize: 20,
   /** Tickets and invoice payments listed in a session. */
   sessionRows: 200,
   /** Carts parked at the same time in the organization. */
   maxHeldCarts: 50,
   maxHeldCartNoteLength: 60,
+  /** Rows per page of a register's movements and reported differences. */
+  registerHistoryPageSize: 20,
 };

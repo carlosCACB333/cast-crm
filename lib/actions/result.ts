@@ -159,6 +159,17 @@ const errorMessages: Record<string, string> = {
   CASH_SESSION_NOT_YOURS:
     "Solo quien abrió la caja o quien gestiona el punto de venta puede operar en ella.",
   CASH_NOT_ENOUGH: "No hay tanto efectivo en la caja.",
+  CASH_OPENING_MISMATCH:
+    "El efectivo contado no coincide con el que debería tener la caja. Reporta la diferencia al administrador.",
+  CASH_OPENING_MATCHES:
+    "Lo contado coincide con el efectivo de la caja: puedes abrirla.",
+  CASH_WITHDRAWAL_TOO_HIGH:
+    "No puedes retirar más efectivo del que has contado.",
+  CASH_REGISTER_OPEN_ADJUST: "Cierra la caja antes de ajustar su efectivo.",
+  CASH_BALANCE_UNCHANGED:
+    "La caja ya tiene ese efectivo y no hay diferencias pendientes.",
+  CASH_REGISTER_HAS_MOVEMENTS:
+    "Esta caja tiene movimientos de efectivo. Desactívala en lugar de eliminarla.",
   POS_PAYMENTS_MISMATCH:
     "Los pagos deben sumar exactamente el total del ticket.",
   INVALID_POS_SOURCE:

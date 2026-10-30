@@ -16,7 +16,7 @@ export const statements = {
   product: ["read", "create", "update", "delete"],
   service: ["read", "create", "update", "delete"],
   sale: ["read", "create", "update", "delete"],
-  pos: ["read", "sell", "manage"],
+  pos: ["read", "sell", "manage", "adjust"],
 } as const;
 
 export type Resource = keyof typeof statements;
@@ -89,7 +89,7 @@ export const RESOURCE_LABELS: Record<
   pos: {
     label: "Punto de venta",
     description:
-      "Ver aperturas de caja, vender en el TPV y gestionar las cajas de todo el equipo",
+      "Ver aperturas de caja, vender en el TPV, gestionar las cajas de todo el equipo y ajustar su efectivo",
   },
 };
 
@@ -101,6 +101,7 @@ export const ACTION_LABELS: Record<string, string> = {
   cancel: "Cancelar",
   manage: "Gestionar",
   sell: "Vender",
+  adjust: "Ajustar efectivo",
 };
 
 /** Roles created with every new organization. They can be edited or deleted later. */
@@ -125,7 +126,7 @@ export const DEFAULT_ROLES: {
       product: ["read", "create", "update", "delete"],
       service: ["read", "create", "update", "delete"],
       sale: ["read", "create", "update", "delete"],
-      pos: ["read", "sell", "manage"],
+      pos: ["read", "sell", "manage", "adjust"],
     },
   },
   {

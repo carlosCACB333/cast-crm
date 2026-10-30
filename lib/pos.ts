@@ -66,6 +66,22 @@ export async function lockOpenCashSession(
 }
 
 /**
+ * Locks a register of the organization until the transaction ends, so its
+ * cash balance changes one operation at a time.
+ */
+export async function lockCashRegister(
+  tx: Prisma.TransactionClient,
+  organizationId: string,
+  registerId: string,
+) {
+  await tx.$queryRaw`
+    SELECT id FROM "cash_register"
+    WHERE id = ${registerId} AND "organizationId" = ${organizationId}
+    FOR UPDATE
+  `;
+}
+
+/**
  * Loads a session of the organization that is still open and that the actor
  * may operate: the person who opened it, or someone with `pos:manage`. The
  * row stays locked until the transaction ends, so movements, voids and the
@@ -93,7 +109,13 @@ export async function findOperableSession(
 
   const session = await db.cashSession.findFirst({
     where: { id: sessionId, organizationId },
-    select: { id: true, status: true, openedById: true, openingAmount: true },
+    select: {
+      id: true,
+      status: true,
+      registerId: true,
+      openedById: true,
+      openingAmount: true,
+    },
   });
 
   if (!session) {
