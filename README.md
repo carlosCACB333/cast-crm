@@ -37,6 +37,16 @@ npm install
 npm run dev
 ```
 
+### Seed test products
+
+Fill the products module of an organization with test data (development only):
+
+```bash
+bun run db:seed:products --org <slug> [--count 40] [--reset] [--seed 1]
+```
+
+`--reset` removes the products tagged `demo` created by a previous run.
+
 ## License
 
 Licensed under the [MIT license](https://github.com/heroui-inc/next-app-template/blob/main/LICENSE).
