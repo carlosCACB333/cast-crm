@@ -1,0 +1,1462 @@
+"use server";
+
+import type { SalesDocumentType, SalesStatus } from "@/config/sales";
+import type { PosCartValues } from "@/lib/validations/pos";
+
+import { APIError } from "better-auth/api";
+import { z } from "zod";
+
+import { getActorContext, requirePermission } from "@/lib/actions/context";
+import { type ActionResult, runAction } from "@/lib/actions/result";
+import {
+  presentationLabel,
+  unitInfo as productUnitInfo,
+} from "@/config/products";
+import {
+  POS_LIMITS,
+  POS_LOADABLE_STATUSES,
+  POS_TICKET_SERIES,
+} from "@/config/pos";
+import { serviceUnitInfo } from "@/config/services";
+import { Prisma } from "@/lib/generated/prisma/client";
+import {
+  findOpenCashSession,
+  findOperableSession,
+  getCashSessionSummary,
+  getPosSettings,
+  lockOpenCashSession,
+} from "@/lib/pos";
+import { includesPermissions } from "@/lib/permissions";
+import { decimalToText } from "@/lib/pricing";
+import { prisma } from "@/lib/prisma";
+import {
+  allocateNumber,
+  applyDeliveryStock,
+  buildLines,
+  createInvoicePayment,
+  customerSnapshot,
+  findSalesDocumentOrThrow,
+  getSalesSettings,
+  resolvePaymentMethods,
+  tenderedAmount,
+  today,
+} from "@/lib/sales";
+import { roundMoney } from "@/lib/sales-math";
+import {
+  emptyToNull,
+  idField,
+  toDbDate,
+  toDecimal,
+} from "@/lib/validations/fields";
+import { storedLinePresentation } from "@/lib/validations/sales";
+import {
+  addCashMovementSchema,
+  cashRegisterFormSchema,
+  cashSessionListSchema,
+  closeCashSessionSchema,
+  collectInvoiceFormSchema,
+  createPosTicketSchema,
+  holdPosCartSchema,
+  openCashSessionSchema,
+  posCartSchema,
+  posItemsSchema,
+  posSettingsSchema,
+  updateCashRegisterSchema,
+} from "@/lib/validations/pos";
+
+// The point of sale sells through the sales module: every ticket is an
+// invoice (channel "POS") issued and paid at once inside the caller's open
+// cash session. Every action derives the organization from the session and
+// checks the `pos:*` permission of the caller's role before touching data.
+
+type Tx = Prisma.TransactionClient;
+
+const userSelect = { id: true, name: true, image: true } as const;
+
+const money = (value: Prisma.Decimal | null) => value?.toNumber() ?? null;
+
+/** Translates the partial unique indexes of open sessions into errors. */
+async function withOpenSessionConstraint<T>(fn: () => Promise<T>) {
+  try {
+    return await fn();
+  } catch (error) {
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === "P2002"
+    ) {
+      throw new APIError("CONFLICT", { code: "CASH_REGISTER_IN_USE" });
+    }
+    throw error;
+  }
+}
+
+/** The caller's open session with its figures, the settings and payment methods. */
+async function findPosState(organizationId: string, userId: string) {
+  const [session, pos, sales, paymentMethods, heldCartCount] =
+    await Promise.all([
+      findOpenCashSession(prisma, organizationId, userId),
+      getPosSettings(organizationId),
+      getSalesSettings(organizationId),
+      prisma.paymentMethod.findMany({
+        where: { organizationId, isActive: true },
+        orderBy: { position: "asc" },
+        select: { id: true, name: true, kind: true },
+      }),
+      prisma.posHeldCart.count({ where: { organizationId } }),
+    ]);
+
+  return {
+    session: session
+      ? {
+          id: session.id,
+          registerId: session.registerId,
+          registerName: session.register.name,
+          openedAt: session.openedAt.toISOString(),
+          summary: await getCashSessionSummary(prisma, organizationId, session),
+        }
+      : null,
+    settings: {
+      ...pos,
+      currency: sales.currency,
+      defaultTaxRate: sales.defaultTaxRate,
+      totalTax: sales.totalTax,
+      stockOnSale: sales.stockOnDelivery,
+    },
+    paymentMethods,
+    heldCartCount,
+    today: today(),
+  };
+}
+
+export type PosState = Awaited<ReturnType<typeof findPosState>>;
+export type PosPaymentMethod = PosState["paymentMethods"][number];
+
+export async function getPosState(): Promise<ActionResult<PosState>> {
+  return runAction(z.undefined(), undefined, async () => {
+    const { organizationId, session } = await requirePermission({
+      pos: ["read"],
+    });
+
+    return findPosState(organizationId, session.user.id);
+  });
+}
+
+export interface PosItem {
+  ref: string;
+  kind: "product" | "service";
+  name: string;
+  code: string | null;
+  barcode: string | null;
+  unit: string;
+  unitPrice: number;
+  taxRate: number | null;
+  /** Units in stock; null when the product does not track it. */
+  stock: number | null;
+  color: string | null;
+  imageUrl: string | null;
+  /** Other ways of selling a product; one must be picked when there are any. */
+  presentations: PosPresentation[];
+  /** Presentation whose barcode is the search, to add it when scanned. */
+  matchedPresentationId: string | null;
+}
+
+export interface PosPresentation {
+  id: string;
+  /** "Caja de 12 ud." */
+  label: string;
+  /** Short unit of the line, e.g. "caja". */
+  unit: string;
+  price: number;
+  barcode: string | null;
+}
+
+/**
+ * Active products and services of the catalog grid, searched by name, code or
+ * exact barcode (also of their presentations), one page at a time.
+ */
+export async function searchPosItems(
+  input: unknown,
+): Promise<ActionResult<{ items: PosItem[]; hasMore: boolean }>> {
+  return runAction(posItemsSchema, input, async ({ q, kind, page }) => {
+    const { organizationId } = await requirePermission({ pos: ["sell"] });
+    const pattern = `%${q.replace(/[\\%_]/g, "\\$&")}%`;
+    const pageSize = POS_LIMITS.itemsPageSize;
+    const rows = await prisma.$queryRaw<
+      {
+        ref: string;
+        kind: "product" | "service";
+        name: string;
+        code: string | null;
+        barcode: string | null;
+        unit: string;
+        price: Prisma.Decimal;
+        taxRate: Prisma.Decimal | null;
+        stock: Prisma.Decimal | null;
+        color: string | null;
+        imageUrl: string | null;
+        matchedPresentationId: string | null;
+      }[]
+    >`
+      SELECT * FROM (
+        SELECT 'product:' || p.id AS ref, 'product' AS kind, p.name, p.sku AS code,
+          p.barcode, p.unit, p.price, p."taxRate",
+          CASE WHEN p."trackStock" THEN p.stock END AS stock, c.color,
+          (SELECT i.url FROM "product_image" i WHERE i."productId" = p.id
+            ORDER BY i.position LIMIT 1) AS "imageUrl",
+          (SELECT pp.id FROM "product_presentation" pp
+            WHERE pp."productId" = p.id AND ${q} <> '' AND pp.barcode = ${q}
+            ORDER BY pp.position LIMIT 1) AS "matchedPresentationId"
+        FROM "product" p
+        LEFT JOIN "product_category" c ON c.id = p."categoryId"
+        WHERE p."organizationId" = ${organizationId} AND p."isActive"
+          AND ${kind === "service" ? Prisma.sql`FALSE` : Prisma.sql`TRUE`}
+          AND (${q} = '' OR p.name ILIKE ${pattern} OR p.sku ILIKE ${pattern}
+            OR p.barcode = ${q}
+            OR EXISTS (SELECT 1 FROM "product_presentation" pp
+              WHERE pp."productId" = p.id AND pp.barcode = ${q}))
+        UNION ALL
+        SELECT 'service:' || s.id, 'service', s.name, s.code, NULL, s.unit,
+          s.price, s."taxRate", NULL, c.color, NULL, NULL
+        FROM "service" s
+        LEFT JOIN "service_category" c ON c.id = s."categoryId"
+        WHERE s."organizationId" = ${organizationId} AND s."isActive"
+          AND ${kind === "product" ? Prisma.sql`FALSE` : Prisma.sql`TRUE`}
+          AND (${q} = '' OR s.name ILIKE ${pattern} OR s.code ILIKE ${pattern})
+      ) items
+      ORDER BY name, ref
+      OFFSET ${(page - 1) * pageSize} LIMIT ${pageSize + 1}
+    `;
+
+    const pageRows = rows.slice(0, pageSize);
+    const productIds = pageRows.flatMap((row) =>
+      row.kind === "product" ? [row.ref.slice("product:".length)] : [],
+    );
+    const presentations = productIds.length
+      ? await prisma.productPresentation.findMany({
+          where: { organizationId, productId: { in: productIds } },
+          orderBy: { position: "asc" },
+          select: {
+            id: true,
+            productId: true,
+            unit: true,
+            factor: true,
+            price: true,
+            barcode: true,
+          },
+        })
+      : [];
+
+    return {
+      hasMore: rows.length > pageSize,
+      items: pageRows.map((row) => ({
+        ref: row.ref,
+        kind: row.kind,
+        name: row.name,
+        code: row.code,
+        barcode: row.barcode,
+        unit:
+          row.kind === "product"
+            ? productUnitInfo(row.unit).short
+            : serviceUnitInfo(row.unit).short,
+        unitPrice: Number(row.price),
+        taxRate: row.taxRate === null ? null : Number(row.taxRate),
+        stock: row.stock === null ? null : Number(row.stock),
+        color: row.color,
+        imageUrl: row.imageUrl,
+        presentations: presentations
+          .filter((item) => `product:${item.productId}` === row.ref)
+          .map((item) => ({
+            id: item.id,
+            label: presentationLabel(
+              item.unit,
+              item.factor.toNumber(),
+              row.unit,
+            ),
+            unit: productUnitInfo(item.unit).short,
+            price: item.price.toNumber(),
+            barcode: item.barcode,
+          })),
+        matchedPresentationId: row.matchedPresentationId,
+      })),
+    };
+  });
+}
+
+/** Throws unless the quote or order can still be charged at the till. */
+async function findLoadableSource(
+  db: Tx | typeof prisma,
+  organizationId: string,
+  id: string,
+) {
+  const source = await findSalesDocumentOrThrow(
+    organizationId,
+    id,
+    {
+      id: true,
+      type: true,
+      status: true,
+      number: true,
+      customerId: true,
+      customerName: true,
+      reference: true,
+      _count: {
+        select: { derived: { where: { status: { not: "CANCELLED" } } } },
+      },
+    },
+    db,
+  );
+  const statuses: readonly string[] =
+    source.type === "QUOTE" || source.type === "ORDER"
+      ? POS_LOADABLE_STATUSES[source.type]
+      : [];
+
+  if (!statuses.includes(source.status) || source._count.derived > 0) {
+    throw new APIError("BAD_REQUEST", { code: "INVALID_POS_SOURCE" });
+  }
+
+  return source;
+}
+
+/** The quote or order a cart was loaded from. */
+export interface PosSourceSummary {
+  id: string;
+  type: SalesDocumentType;
+  number: string | null;
+}
+
+/** Customer and lines of a quote or order, to charge it at the till. */
+export async function getPosSourceDocument(id: unknown): Promise<
+  ActionResult<{
+    id: string;
+    type: SalesDocumentType;
+    number: string | null;
+    customerId: string | null;
+    customerName: string;
+    lines: {
+      itemRef: string;
+      presentationId: string;
+      description: string;
+      unit: string;
+      quantity: string;
+      unitPrice: string;
+      discount: string;
+      taxRate: string;
+    }[];
+  }>
+> {
+  return runAction(idField, id, async (documentId) => {
+    const { organizationId } = await requirePermission({ pos: ["sell"] });
+    const source = await findLoadableSource(prisma, organizationId, documentId);
+    const lines = await prisma.salesDocumentLine.findMany({
+      where: { documentId, organizationId },
+      orderBy: { position: "asc" },
+      select: {
+        productId: true,
+        serviceId: true,
+        presentationId: true,
+        presentationLabel: true,
+        description: true,
+        unit: true,
+        quantity: true,
+        unitPrice: true,
+        discount: true,
+        taxRate: true,
+      },
+    });
+
+    return {
+      id: source.id,
+      type: source.type,
+      number: source.number,
+      customerId: source.customerId,
+      customerName: source.customerName,
+      lines: lines.map((line) => ({
+        itemRef: line.productId
+          ? `product:${line.productId}`
+          : line.serviceId
+            ? `service:${line.serviceId}`
+            : "",
+        presentationId: storedLinePresentation(line),
+        description: line.description,
+        unit: line.unit ?? "",
+        quantity: decimalToText(line.quantity.toNumber()),
+        unitPrice: decimalToText(line.unitPrice.toNumber()),
+        discount: line.discount.isZero()
+          ? ""
+          : decimalToText(line.discount.toNumber()),
+        taxRate: decimalToText(line.taxRate.toNumber()),
+      })),
+    };
+  });
+}
+
+/**
+ * Held carts the caller can see: shared ones plus those of the register the
+ * caller has open. Point of sale managers see them all.
+ */
+function visibleHeldCarts(
+  organizationId: string,
+  registerId: string | null,
+  canManage: boolean,
+): Prisma.PosHeldCartWhereInput {
+  if (canManage) return { organizationId };
+
+  return {
+    organizationId,
+    OR: [{ isShared: true }, ...(registerId ? [{ registerId }] : [])],
+  };
+}
+
+/** The caller's open register and whether they manage the point of sale. */
+async function heldCartAccess(
+  organizationId: string,
+  userId: string,
+  permissions: Parameters<typeof includesPermissions>[0],
+) {
+  const session = await findOpenCashSession(prisma, organizationId, userId);
+
+  return {
+    registerId: session?.registerId ?? null,
+    canManage: includesPermissions(permissions, { pos: ["manage"] }),
+  };
+}
+
+/** Carts parked at the till, oldest first, for any seller of the organization. */
+async function findHeldCarts(
+  organizationId: string,
+  userId: string,
+  {
+    registerId: currentRegister,
+    canManage,
+  }: { registerId: string | null; canManage: boolean },
+) {
+  const carts = await prisma.posHeldCart.findMany({
+    where: visibleHeldCarts(organizationId, currentRegister, canManage),
+    orderBy: { createdAt: "asc" },
+    take: POS_LIMITS.maxHeldCarts,
+    select: {
+      id: true,
+      note: true,
+      itemCount: true,
+      total: true,
+      createdAt: true,
+      createdById: true,
+      registerId: true,
+      isShared: true,
+      register: { select: { name: true } },
+      createdBy: { select: { name: true } },
+      customer: { select: { name: true } },
+      source: { select: { type: true, number: true } },
+    },
+  });
+  const items = carts.map(
+    ({ total, createdAt, createdById, registerId, ...cart }) => ({
+      ...cart,
+      total: total.toNumber(),
+      createdAt: createdAt.toISOString(),
+      /** Saved at the register the caller has open. */
+      isCurrentRegister: Boolean(registerId && registerId === currentRegister),
+      canDelete: canManage || createdById === userId,
+    }),
+  );
+
+  // The caller's register first, each group oldest first.
+  return [
+    ...items.filter((item) => item.isCurrentRegister),
+    ...items.filter((item) => !item.isCurrentRegister),
+  ];
+}
+
+export type HeldCart = Awaited<ReturnType<typeof findHeldCarts>>[number];
+
+export async function listHeldCarts(): Promise<ActionResult<HeldCart[]>> {
+  return runAction(z.undefined(), undefined, async () => {
+    const { organizationId, session, access } = await requirePermission({
+      pos: ["sell"],
+    });
+
+    return findHeldCarts(
+      organizationId,
+      session.user.id,
+      await heldCartAccess(organizationId, session.user.id, access.permissions),
+    );
+  });
+}
+
+/**
+ * Parks the cart to charge it later. The lines are checked like a sale
+ * (items of the organization, valid amounts) and stored as typed.
+ */
+export async function holdPosCart(input: unknown): Promise<ActionResult> {
+  return runAction(holdPosCartSchema, input, async (values) => {
+    const { organizationId, session } = await requirePermission({
+      pos: ["sell"],
+    });
+    const { totalTax } = await getSalesSettings(organizationId);
+    const [lines] = await Promise.all([
+      buildLines(organizationId, values.lines, totalTax),
+      values.customerId
+        ? customerSnapshot(organizationId, values.customerId)
+        : null,
+      values.sourceId
+        ? findLoadableSource(prisma, organizationId, values.sourceId)
+        : null,
+    ]);
+
+    await prisma.$transaction(async (tx) => {
+      const [count, cashSession] = [
+        await tx.posHeldCart.count({ where: { organizationId } }),
+        await findOpenCashSession(tx, organizationId, session.user.id),
+      ];
+
+      if (count >= POS_LIMITS.maxHeldCarts) {
+        throw new APIError("BAD_REQUEST", { code: "TOO_MANY_HELD_CARTS" });
+      }
+      // A cart kept for one register needs that register open.
+      if (!values.isShared && !cashSession) {
+        throw new APIError("BAD_REQUEST", { code: "NO_OPEN_CASH_SESSION" });
+      }
+
+      await tx.posHeldCart.create({
+        data: {
+          organizationId,
+          note: emptyToNull(values.note),
+          customerId: values.customerId || null,
+          sourceId: values.sourceId || null,
+          registerId: cashSession?.registerId ?? null,
+          isShared: values.isShared,
+          lines: values.lines,
+          itemCount: values.lines.length,
+          total: lines.totals.total,
+          createdById: session.user.id,
+        },
+      });
+    });
+
+    return undefined;
+  });
+}
+
+/**
+ * Takes a parked cart back to the till and removes it, so two tills cannot
+ * charge it twice. A source document that can no longer be charged is left
+ * out; its lines stay.
+ */
+export async function recoverHeldCart(id: unknown): Promise<
+  ActionResult<{
+    customerId: string;
+    lines: PosCartValues["lines"];
+    source: PosSourceSummary | null;
+  }>
+> {
+  return runAction(idField, id, async (cartId) => {
+    const { organizationId, session, access } = await requirePermission({
+      pos: ["sell"],
+    });
+    const { registerId, canManage } = await heldCartAccess(
+      organizationId,
+      session.user.id,
+      access.permissions,
+    );
+    const where = {
+      ...visibleHeldCarts(organizationId, registerId, canManage),
+      id: cartId,
+    };
+    const cart = await prisma.$transaction(async (tx) => {
+      const found = await tx.posHeldCart.findFirst({
+        where,
+        select: { customerId: true, sourceId: true, lines: true },
+      });
+      const { count } = await tx.posHeldCart.deleteMany({ where });
+
+      if (!found || count === 0) {
+        throw new APIError("NOT_FOUND", { code: "HELD_CART_NOT_FOUND" });
+      }
+
+      return found;
+    });
+    const lines = posCartSchema.shape.lines.safeParse(cart.lines);
+    const source = cart.sourceId
+      ? await findLoadableSource(prisma, organizationId, cart.sourceId).catch(
+          () => null,
+        )
+      : null;
+
+    return {
+      customerId: cart.customerId ?? "",
+      lines: lines.success ? lines.data : [],
+      source: source
+        ? { id: source.id, type: source.type, number: source.number }
+        : null,
+    };
+  });
+}
+
+export async function deleteHeldCart(id: unknown): Promise<ActionResult> {
+  return runAction(idField, id, async (cartId) => {
+    const { organizationId, session, access } = await requirePermission({
+      pos: ["sell"],
+    });
+    const cart = await prisma.posHeldCart.findFirst({
+      where: { id: cartId, organizationId },
+      select: { createdById: true },
+    });
+
+    if (!cart) {
+      throw new APIError("NOT_FOUND", { code: "HELD_CART_NOT_FOUND" });
+    }
+    if (
+      cart.createdById !== session.user.id &&
+      !includesPermissions(access.permissions, { pos: ["manage"] })
+    ) {
+      throw new APIError("FORBIDDEN", { code: "HELD_CART_NOT_YOURS" });
+    }
+
+    await prisma.posHeldCart.deleteMany({
+      where: { id: cartId, organizationId },
+    });
+
+    return undefined;
+  });
+}
+
+/** What a quote or order becomes once it is charged at the till. */
+const SOURCE_STATUS_ON_SALE: Partial<
+  Record<SalesDocumentType, { from: readonly SalesStatus[]; to: SalesStatus }>
+> = {
+  QUOTE: { from: ["DRAFT", "SENT"], to: "ACCEPTED" },
+  // The customer takes the goods at the counter.
+  ORDER: { from: ["DRAFT", "CONFIRMED"], to: "DELIVERED" },
+};
+
+/**
+ * Sells the cart: creates the ticket (an invoice of the POS series, issued
+ * and paid), its payments in the caller's open session and, when the sales
+ * settings say so, takes the units out of the stock.
+ */
+export async function createPosTicket(
+  input: unknown,
+): Promise<ActionResult<{ id: string; number: string; change: number }>> {
+  return runAction(createPosTicketSchema, input, async (values) => {
+    const { organizationId, session } = await requirePermission({
+      pos: ["sell"],
+    });
+    const userId = session.user.id;
+    const settings = await getSalesSettings(organizationId);
+    const [pos, customer, lines] = await Promise.all([
+      getPosSettings(organizationId),
+      values.customerId
+        ? customerSnapshot(organizationId, values.customerId)
+        : null,
+      buildLines(organizationId, values.lines, settings.totalTax),
+    ]);
+    const amounts = values.payments.map((payment) =>
+      Number(toDecimal(payment.amount)),
+    );
+    const total = lines.totals.total;
+
+    // The till charges the whole ticket; partial payments are invoices.
+    if (
+      roundMoney(amounts.reduce((sum, amount) => sum + amount, 0)) !== total
+    ) {
+      throw new APIError("BAD_REQUEST", { code: "POS_PAYMENTS_MISMATCH" });
+    }
+
+    return prisma.$transaction(async (tx) => {
+      const cashSession = await lockOpenCashSession(tx, organizationId, userId);
+
+      if (!cashSession) {
+        throw new APIError("BAD_REQUEST", { code: "NO_OPEN_CASH_SESSION" });
+      }
+
+      const methods = await resolvePaymentMethods(
+        tx,
+        organizationId,
+        values.payments.map((payment) => payment.paymentMethodId),
+      );
+      const source = values.sourceId
+        ? await findLoadableSource(tx, organizationId, values.sourceId)
+        : null;
+      const issueDate = toDbDate(today());
+      const number = await allocateNumber(
+        tx,
+        organizationId,
+        "INVOICE",
+        issueDate,
+        pos.ticketPrefix,
+        POS_TICKET_SERIES,
+      );
+      const payments = values.payments.map((payment, index) => {
+        const kind = methods.get(payment.paymentMethodId)!.kind;
+        const tendered = tenderedAmount(kind, amounts[index], payment.tendered);
+
+        return {
+          organizationId,
+          amount: amounts[index],
+          paidOn: issueDate,
+          paymentMethodId: payment.paymentMethodId,
+          tendered,
+          cashSessionId: cashSession.id,
+          authorId: userId,
+        };
+      });
+      const ticket = await tx.salesDocument.create({
+        data: {
+          organizationId,
+          type: "INVOICE",
+          status: "PAID",
+          channel: "POS",
+          cashSessionId: cashSession.id,
+          number,
+          issueDate,
+          dueDate: issueDate,
+          ...(customer ?? {
+            customerId: null,
+            customerName: pos.walkInCustomerName,
+            customerTaxId: null,
+            customerEmail: null,
+            customerAddress: null,
+          }),
+          reference: source?.reference ?? null,
+          currency: settings.currency,
+          ...lines.totals,
+          paidTotal: total,
+          sourceId: source?.id ?? null,
+          ownerId: userId,
+          createdById: userId,
+          lines: { createMany: { data: lines.rows } },
+          payments: { createMany: { data: payments } },
+        },
+        select: { id: true },
+      });
+
+      if (settings.stockOnDelivery) {
+        await applyDeliveryStock(tx, {
+          organizationId,
+          documentId: ticket.id,
+          number,
+          authorId: userId,
+          direction: "out",
+          reason: `Ticket ${number}`,
+        });
+        await tx.salesDocument.update({
+          where: { id: ticket.id },
+          data: { stockApplied: true },
+        });
+      }
+
+      const sourceMove = source ? SOURCE_STATUS_ON_SALE[source.type] : null;
+
+      if (source && sourceMove?.from.includes(source.status)) {
+        await tx.salesDocument.updateMany({
+          where: { id: source.id, organizationId, status: source.status },
+          data: { status: sourceMove.to, statusChangedAt: new Date() },
+        });
+      }
+
+      return {
+        id: ticket.id,
+        number,
+        change: roundMoney(
+          payments.reduce(
+            (sum, payment) =>
+              sum + (payment.tendered ? payment.tendered - payment.amount : 0),
+            0,
+          ),
+        ),
+      };
+    });
+  });
+}
+
+/**
+ * Voids a ticket of a session that is still open: its payments are refunded
+ * from the same till (negative payments by method) and the units go back to
+ * the stock.
+ */
+export async function voidPosTicket(id: unknown): Promise<ActionResult> {
+  return runAction(idField, id, async (documentId) => {
+    const { organizationId, session, access } = await requirePermission({
+      pos: ["sell"],
+    });
+    const userId = session.user.id;
+
+    await prisma.$transaction(async (tx) => {
+      const ticket = await findSalesDocumentOrThrow(
+        organizationId,
+        documentId,
+        {
+          channel: true,
+          status: true,
+          number: true,
+          stockApplied: true,
+          cashSessionId: true,
+          payments: { select: { amount: true, paymentMethodId: true } },
+        },
+        tx,
+      );
+
+      if (
+        ticket.channel !== "POS" ||
+        ticket.status === "CANCELLED" ||
+        !ticket.cashSessionId
+      ) {
+        throw new APIError("BAD_REQUEST", { code: "INVALID_POS_TICKET" });
+      }
+
+      await findOperableSession(tx, {
+        organizationId,
+        sessionId: ticket.cashSessionId,
+        userId,
+        permissions: access.permissions,
+      });
+
+      const byMethod = new Map<string, Prisma.Decimal>();
+
+      for (const payment of ticket.payments) {
+        byMethod.set(
+          payment.paymentMethodId,
+          (byMethod.get(payment.paymentMethodId) ?? new Prisma.Decimal(0)).plus(
+            payment.amount,
+          ),
+        );
+      }
+
+      const paidOn = toDbDate(today());
+      const refunds = [...byMethod]
+        .filter(([, amount]) => amount.gt(0))
+        .map(([paymentMethodId, amount]) => ({
+          organizationId,
+          documentId,
+          amount: amount.negated(),
+          paidOn,
+          paymentMethodId,
+          cashSessionId: ticket.cashSessionId,
+          note: `Anulación ${ticket.number ?? ""}`.trim(),
+          authorId: userId,
+        }));
+
+      if (refunds.length) await tx.salesPayment.createMany({ data: refunds });
+
+      if (ticket.stockApplied) {
+        await applyDeliveryStock(tx, {
+          organizationId,
+          documentId,
+          number: ticket.number,
+          authorId: userId,
+          direction: "in",
+          reason: `Ticket anulado ${ticket.number ?? ""}`.trim(),
+        });
+      }
+
+      const { count } = await tx.salesDocument.updateMany({
+        where: { id: documentId, organizationId, status: ticket.status },
+        data: {
+          status: "CANCELLED",
+          paidTotal: 0,
+          stockApplied: false,
+          statusChangedAt: new Date(),
+        },
+      });
+
+      if (count === 0) {
+        throw new APIError("CONFLICT", { code: "SALES_DOCUMENT_CHANGED" });
+      }
+    });
+
+    return undefined;
+  });
+}
+
+/**
+ * Collects (part of) an issued invoice at the till: the payment goes into the
+ * caller's open session and counts in its cash count.
+ */
+export async function collectInvoiceAtPos(
+  input: unknown,
+): Promise<ActionResult<{ change: number }>> {
+  return runAction(
+    collectInvoiceFormSchema,
+    input,
+    async ({ documentId, payment }) => {
+      const { organizationId, session } = await requirePermission({
+        pos: ["sell"],
+      });
+      const amount = Number(toDecimal(payment.amount));
+
+      return prisma.$transaction(async (tx) => {
+        const cashSession = await lockOpenCashSession(
+          tx,
+          organizationId,
+          session.user.id,
+        );
+
+        if (!cashSession) {
+          throw new APIError("BAD_REQUEST", { code: "NO_OPEN_CASH_SESSION" });
+        }
+
+        await createInvoicePayment(tx, {
+          organizationId,
+          documentId,
+          amount,
+          paidOn: toDbDate(today()),
+          paymentMethodId: payment.paymentMethodId,
+          tendered: payment.tendered,
+          note: `Cobrado en ${cashSession.register.name}`,
+          cashSessionId: cashSession.id,
+          authorId: session.user.id,
+        });
+
+        const tendered = Number(toDecimal(payment.tendered) ?? 0);
+
+        return {
+          change: tendered > amount ? roundMoney(tendered - amount) : 0,
+        };
+      });
+    },
+  );
+}
+
+/** What is left to collect of an issued invoice, to charge it at the till. */
+export async function getPosInvoiceBalance(
+  id: unknown,
+): Promise<
+  ActionResult<{ number: string | null; customerName: string; balance: number }>
+> {
+  return runAction(idField, id, async (documentId) => {
+    const { organizationId } = await requirePermission({ pos: ["sell"] });
+    const invoice = await findSalesDocumentOrThrow(organizationId, documentId, {
+      type: true,
+      status: true,
+      number: true,
+      customerName: true,
+      total: true,
+      paidTotal: true,
+    });
+
+    if (invoice.type !== "INVOICE" || invoice.status !== "ISSUED") {
+      throw new APIError("BAD_REQUEST", { code: "PAYMENT_NOT_ALLOWED" });
+    }
+
+    return {
+      number: invoice.number,
+      customerName: invoice.customerName,
+      balance: roundMoney(
+        invoice.total.toNumber() - invoice.paidTotal.toNumber(),
+      ),
+    };
+  });
+}
+
+/** Opens a register for the caller, with the cash in the drawer. */
+export async function openCashSession(
+  input: unknown,
+): Promise<ActionResult<{ id: string }>> {
+  return runAction(
+    openCashSessionSchema,
+    input,
+    async ({ registerId, openingAmount }) => {
+      const { organizationId, session } = await requirePermission({
+        pos: ["sell"],
+      });
+
+      return withOpenSessionConstraint(() =>
+        prisma.$transaction(async (tx) => {
+          const register = await tx.cashRegister.findFirst({
+            where: { id: registerId, organizationId, isActive: true },
+            select: {
+              id: true,
+              _count: { select: { sessions: { where: { status: "OPEN" } } } },
+            },
+          });
+          const mine = await findOpenCashSession(
+            tx,
+            organizationId,
+            session.user.id,
+          );
+
+          if (!register) {
+            throw new APIError("BAD_REQUEST", {
+              code: "INVALID_CASH_REGISTER",
+            });
+          }
+          if (mine) {
+            throw new APIError("BAD_REQUEST", {
+              code: "CASH_SESSION_ALREADY_OPEN",
+            });
+          }
+          if (register._count.sessions > 0) {
+            throw new APIError("CONFLICT", { code: "CASH_REGISTER_IN_USE" });
+          }
+
+          return tx.cashSession.create({
+            data: {
+              organizationId,
+              registerId,
+              openedById: session.user.id,
+              openingAmount: Number(toDecimal(openingAmount)),
+            },
+            select: { id: true },
+          });
+        }),
+      );
+    },
+  );
+}
+
+/** Puts cash in or takes it out of an open session's drawer. */
+export async function addCashMovement(input: unknown): Promise<ActionResult> {
+  return runAction(
+    addCashMovementSchema,
+    input,
+    async ({ sessionId, values }) => {
+      const { organizationId, session, access } = await requirePermission({
+        pos: ["sell"],
+      });
+
+      await prisma.$transaction(async (tx) => {
+        const cashSession = await findOperableSession(tx, {
+          organizationId,
+          sessionId,
+          userId: session.user.id,
+          permissions: access.permissions,
+        });
+        const amount = Number(toDecimal(values.amount));
+
+        if (values.type === "OUT") {
+          const { expectedCash } = await getCashSessionSummary(
+            tx,
+            organizationId,
+            cashSession,
+          );
+
+          if (amount > expectedCash) {
+            throw new APIError("BAD_REQUEST", { code: "CASH_NOT_ENOUGH" });
+          }
+        }
+
+        await tx.cashMovement.create({
+          data: {
+            organizationId,
+            sessionId,
+            type: values.type,
+            amount,
+            reason: values.reason,
+            authorId: session.user.id,
+          },
+        });
+      });
+
+      return undefined;
+    },
+  );
+}
+
+/**
+ * Closes a session with the cash counted: stores what should have been in
+ * the drawer and the difference. Its tickets and payments are locked after.
+ */
+export async function closeCashSession(input: unknown): Promise<ActionResult> {
+  return runAction(
+    closeCashSessionSchema,
+    input,
+    async ({ sessionId, values }) => {
+      const { organizationId, session, access } = await requirePermission({
+        pos: ["sell"],
+      });
+
+      await prisma.$transaction(async (tx) => {
+        const cashSession = await findOperableSession(tx, {
+          organizationId,
+          sessionId,
+          userId: session.user.id,
+          permissions: access.permissions,
+        });
+        const { expectedCash } = await getCashSessionSummary(
+          tx,
+          organizationId,
+          cashSession,
+        );
+        const countedCash = Number(toDecimal(values.countedCash));
+        const { count } = await tx.cashSession.updateMany({
+          where: { id: sessionId, organizationId, status: "OPEN" },
+          data: {
+            status: "CLOSED",
+            closedById: session.user.id,
+            closedAt: new Date(),
+            expectedCash,
+            countedCash,
+            difference: roundMoney(countedCash - expectedCash),
+            closingNotes: emptyToNull(values.notes),
+          },
+        });
+
+        if (count === 0) {
+          throw new APIError("CONFLICT", { code: "CASH_SESSION_CLOSED" });
+        }
+      });
+
+      return undefined;
+    },
+  );
+}
+
+const sessionRowSelect = {
+  id: true,
+  status: true,
+  openedAt: true,
+  closedAt: true,
+  openingAmount: true,
+  expectedCash: true,
+  countedCash: true,
+  difference: true,
+  register: { select: { id: true, name: true } },
+  openedBy: { select: userSelect },
+  closedBy: { select: userSelect },
+  _count: {
+    select: { documents: { where: { status: { not: "CANCELLED" } } } },
+  },
+} satisfies Prisma.CashSessionSelect;
+
+function serializeSessionRow({
+  openedAt,
+  closedAt,
+  openingAmount,
+  expectedCash,
+  countedCash,
+  difference,
+  _count,
+  ...rest
+}: Prisma.CashSessionGetPayload<{ select: typeof sessionRowSelect }>) {
+  return {
+    ...rest,
+    openedAt: openedAt.toISOString(),
+    closedAt: closedAt?.toISOString() ?? null,
+    openingAmount: openingAmount.toNumber(),
+    expectedCash: money(expectedCash),
+    countedCash: money(countedCash),
+    difference: money(difference),
+    ticketCount: _count.documents,
+  };
+}
+
+async function findCashSessions(
+  organizationId: string,
+  filters: z.output<typeof cashSessionListSchema>,
+) {
+  const where: Prisma.CashSessionWhereInput = { organizationId };
+
+  if (filters.registerId) where.registerId = filters.registerId;
+  if (filters.status) where.status = filters.status;
+
+  const pageSize = POS_LIMITS.sessionsPageSize;
+  const [items, total] = await prisma.$transaction([
+    prisma.cashSession.findMany({
+      where,
+      orderBy: [{ openedAt: "desc" }, { id: "asc" }],
+      skip: (filters.page - 1) * pageSize,
+      take: pageSize,
+      select: sessionRowSelect,
+    }),
+    prisma.cashSession.count({ where }),
+  ]);
+
+  return {
+    items: items.map(serializeSessionRow),
+    total,
+    page: filters.page,
+    pageSize,
+    pageCount: Math.max(1, Math.ceil(total / pageSize)),
+  };
+}
+
+export type CashSessionList = Awaited<ReturnType<typeof findCashSessions>>;
+export type CashSessionRow = CashSessionList["items"][number];
+
+export async function listCashSessions(
+  input: unknown,
+): Promise<ActionResult<CashSessionList>> {
+  return runAction(cashSessionListSchema, input, async (filters) => {
+    const { organizationId } = await requirePermission({ pos: ["read"] });
+
+    return findCashSessions(organizationId, filters);
+  });
+}
+
+async function findCashSession(
+  organizationId: string,
+  id: string,
+  actor: { userId: string; canManage: boolean },
+) {
+  const session = await prisma.cashSession.findFirst({
+    where: { id, organizationId },
+    select: { ...sessionRowSelect, openedById: true, closingNotes: true },
+  });
+
+  if (!session) {
+    throw new APIError("NOT_FOUND", { code: "CASH_SESSION_NOT_FOUND" });
+  }
+
+  const [summary, movements, tickets, collected] = await Promise.all([
+    getCashSessionSummary(prisma, organizationId, session),
+    prisma.cashMovement.findMany({
+      where: { organizationId, sessionId: id },
+      orderBy: { createdAt: "desc" },
+      select: {
+        id: true,
+        type: true,
+        amount: true,
+        reason: true,
+        createdAt: true,
+        author: { select: userSelect },
+      },
+    }),
+    prisma.salesDocument.findMany({
+      where: { organizationId, cashSessionId: id },
+      orderBy: { createdAt: "desc" },
+      take: POS_LIMITS.sessionRows,
+      select: {
+        id: true,
+        number: true,
+        status: true,
+        customerName: true,
+        total: true,
+        createdAt: true,
+        payments: {
+          where: { amount: { gt: 0 } },
+          select: { paymentMethod: { select: { name: true } } },
+        },
+      },
+    }),
+    // Invoices of the sales module collected at this till.
+    prisma.salesPayment.findMany({
+      where: {
+        organizationId,
+        cashSessionId: id,
+        document: { channel: "BACKOFFICE" },
+      },
+      orderBy: { createdAt: "desc" },
+      take: POS_LIMITS.sessionRows,
+      select: {
+        id: true,
+        amount: true,
+        createdAt: true,
+        paymentMethod: { select: { name: true } },
+        document: {
+          select: { id: true, number: true, customerName: true },
+        },
+      },
+    }),
+  ]);
+  const { openedById, closingNotes, ...row } = session;
+
+  return {
+    ...serializeSessionRow(row),
+    closingNotes,
+    canOperate:
+      session.status === "OPEN" &&
+      (openedById === actor.userId || actor.canManage),
+    summary,
+    movements: movements.map((movement) => ({
+      ...movement,
+      amount: movement.amount.toNumber(),
+      createdAt: movement.createdAt.toISOString(),
+    })),
+    tickets: tickets.map(({ payments, total, createdAt, ...ticket }) => ({
+      ...ticket,
+      total: total.toNumber(),
+      createdAt: createdAt.toISOString(),
+      methods: [...new Set(payments.map((p) => p.paymentMethod.name))],
+    })),
+    collected: collected.map((payment) => ({
+      ...payment,
+      amount: payment.amount.toNumber(),
+      createdAt: payment.createdAt.toISOString(),
+      method: payment.paymentMethod.name,
+    })),
+  };
+}
+
+export type CashSessionDetail = Awaited<ReturnType<typeof findCashSession>>;
+
+export async function getCashSession(
+  id: unknown,
+): Promise<ActionResult<CashSessionDetail>> {
+  return runAction(idField, id, async (sessionId) => {
+    const { organizationId, session, access } = await requirePermission({
+      pos: ["read"],
+    });
+
+    return findCashSession(organizationId, sessionId, {
+      userId: session.user.id,
+      canManage: includesPermissions(access.permissions, { pos: ["manage"] }),
+    });
+  });
+}
+
+async function findCashRegisters(organizationId: string) {
+  const registers = await prisma.cashRegister.findMany({
+    where: { organizationId },
+    orderBy: [{ name: "asc" }, { id: "asc" }],
+    select: {
+      id: true,
+      name: true,
+      isActive: true,
+      _count: { select: { sessions: true } },
+      sessions: {
+        where: { status: "OPEN" },
+        select: { id: true, openedAt: true, openedBy: { select: userSelect } },
+      },
+    },
+  });
+
+  return registers.map(({ _count, sessions, ...register }) => ({
+    ...register,
+    sessionCount: _count.sessions,
+    openSession: sessions[0]
+      ? { ...sessions[0], openedAt: sessions[0].openedAt.toISOString() }
+      : null,
+  }));
+}
+
+export type CashRegisterItem = Awaited<
+  ReturnType<typeof findCashRegisters>
+>[number];
+
+export async function listCashRegisters(): Promise<
+  ActionResult<CashRegisterItem[]>
+> {
+  return runAction(z.undefined(), undefined, async () => {
+    const { organizationId } = await requirePermission({ pos: ["read"] });
+
+    return findCashRegisters(organizationId);
+  });
+}
+
+/** Translates the unique register name into a readable error. */
+async function withRegisterName<T>(fn: () => Promise<T>) {
+  try {
+    return await fn();
+  } catch (error) {
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === "P2002"
+    ) {
+      throw new APIError("BAD_REQUEST", { code: "CASH_REGISTER_NAME_TAKEN" });
+    }
+    throw error;
+  }
+}
+
+export async function createCashRegister(
+  input: unknown,
+): Promise<ActionResult> {
+  return runAction(cashRegisterFormSchema, input, async (values) => {
+    const { organizationId } = await requirePermission({ pos: ["manage"] });
+
+    if (
+      (await prisma.cashRegister.count({ where: { organizationId } })) >=
+      POS_LIMITS.maxRegisters
+    ) {
+      throw new APIError("BAD_REQUEST", { code: "TOO_MANY_CASH_REGISTERS" });
+    }
+
+    await withRegisterName(() =>
+      prisma.cashRegister.create({ data: { ...values, organizationId } }),
+    );
+
+    return undefined;
+  });
+}
+
+export async function updateCashRegister(
+  input: unknown,
+): Promise<ActionResult> {
+  return runAction(updateCashRegisterSchema, input, async ({ id, values }) => {
+    const { organizationId } = await requirePermission({ pos: ["manage"] });
+
+    await withRegisterName(() =>
+      prisma.$transaction(async (tx) => {
+        const register = await tx.cashRegister.findFirst({
+          where: { id, organizationId },
+          select: {
+            _count: { select: { sessions: { where: { status: "OPEN" } } } },
+          },
+        });
+
+        if (!register) {
+          throw new APIError("NOT_FOUND", { code: "INVALID_CASH_REGISTER" });
+        }
+        if (!values.isActive && register._count.sessions > 0) {
+          throw new APIError("BAD_REQUEST", { code: "CASH_REGISTER_OPEN" });
+        }
+
+        await tx.cashRegister.update({ where: { id }, data: values });
+      }),
+    );
+
+    return undefined;
+  });
+}
+
+/** Only registers never opened can be deleted; the others are deactivated. */
+export async function deleteCashRegister(id: unknown): Promise<ActionResult> {
+  return runAction(idField, id, async (registerId) => {
+    const { organizationId } = await requirePermission({ pos: ["manage"] });
+
+    await prisma.$transaction(async (tx) => {
+      const register = await tx.cashRegister.findFirst({
+        where: { id: registerId, organizationId },
+        select: { _count: { select: { sessions: true } } },
+      });
+
+      if (!register) {
+        throw new APIError("NOT_FOUND", { code: "INVALID_CASH_REGISTER" });
+      }
+      if (register._count.sessions > 0) {
+        throw new APIError("BAD_REQUEST", {
+          code: "CASH_REGISTER_HAS_SESSIONS",
+        });
+      }
+
+      await tx.cashRegister.delete({ where: { id: registerId } });
+    });
+
+    return undefined;
+  });
+}
+
+/** Point of sale settings of the active organization, readable by any member. */
+export async function getPosSettingsAction(): Promise<
+  ActionResult<Awaited<ReturnType<typeof getPosSettings>>>
+> {
+  return runAction(z.undefined(), undefined, async () => {
+    const { organizationId } = await getActorContext();
+
+    return getPosSettings(organizationId);
+  });
+}
+
+export async function updatePosSettings(input: unknown): Promise<ActionResult> {
+  return runAction(posSettingsSchema, input, async (values) => {
+    const { organizationId } = await requirePermission({
+      organization: ["update"],
+    });
+    const { prefixes } = await getSalesSettings(organizationId);
+
+    // Tickets are invoices too; their numbers must not collide.
+    if (values.ticketPrefix === prefixes.INVOICE) {
+      throw new APIError("BAD_REQUEST", { code: "SALES_PREFIX_IN_USE" });
+    }
+
+    await prisma.organization.update({
+      where: { id: organizationId },
+      data: {
+        posTicketPrefix: values.ticketPrefix,
+        posWalkInCustomerName: values.walkInCustomerName,
+      },
+    });
+
+    return undefined;
+  });
+}

@@ -1,0 +1,23 @@
+@import "tailwindcss";
+@import "@heroui/styles";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+	--font-sans: "font", sans-serif;
+	--font-mono: "monospace", monospace;
+}
+
+/*
+ * Categorical series colors for charts, assigned in this fixed order. The dark
+ * steps are tuned for dark surfaces, not an automatic inversion.
+ */
+:root {
+	--chart-1: #2a78d6;
+	--chart-2: #eb6834;
+}
+
+.dark {
+	--chart-1: #3987e5;
+	--chart-2: #d95926;
+}

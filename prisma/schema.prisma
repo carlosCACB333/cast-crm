@@ -1,0 +1,912 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id            String    @id
+  name          String
+  email         String    @unique
+  emailVerified Boolean   @default(false)
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  sessions      Session[]
+  accounts      Account[]
+
+  members     Member[]
+  invitations Invitation[]
+
+  ownedCustomers     Customer[]             @relation("CustomerOwner")
+  createdCustomers   Customer[]             @relation("CustomerCreator")
+  customerNotes      CustomerNote[]
+  ownedLeads         Lead[]                 @relation("LeadOwner")
+  createdLeads       Lead[]                 @relation("LeadCreator")
+  leadNotes          LeadNote[]
+  createdProducts    Product[]              @relation("ProductCreator")
+  stockMovements     ProductStockMovement[]
+  createdServices    Service[]              @relation("ServiceCreator")
+  ownedSales         SalesDocument[]        @relation("SalesOwner")
+  createdSales       SalesDocument[]        @relation("SalesCreator")
+  salesPayments      SalesPayment[]
+  openedCashSessions CashSession[]          @relation("CashSessionOpener")
+  closedCashSessions CashSession[]          @relation("CashSessionCloser")
+  cashMovements      CashMovement[]
+  heldCarts          PosHeldCart[]
+
+  @@map("user")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  activeOrganizationId String?
+
+  @@index([userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([userId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verification")
+}
+
+model Organization {
+  id          String       @id
+  name        String
+  slug        String
+  logo        String?
+  createdAt   DateTime
+  metadata    String?
+  members     Member[]
+  invitations Invitation[]
+
+  roles OrganizationRole[]
+
+  customers            Customer[]
+  customerStatuses     CustomerStatus[]
+  customerNotes        CustomerNote[]
+  pipelines            Pipeline[]
+  pipelineStages       PipelineStage[]
+  leads                Lead[]
+  leadNotes            LeadNote[]
+  productCategories    ProductCategory[]
+  products             Product[]
+  stockMovements       ProductStockMovement[]
+  productPresentations ProductPresentation[]
+  productImages        ProductImage[]
+  serviceCategories    ServiceCategory[]
+  services             Service[]
+  salesDocuments       SalesDocument[]
+  salesDocumentLines   SalesDocumentLine[]
+  salesPayments        SalesPayment[]
+  salesCounters        SalesCounter[]
+  paymentMethods       PaymentMethod[]
+  cashRegisters        CashRegister[]
+  cashSessions         CashSession[]
+  cashMovements        CashMovement[]
+  posHeldCarts         PosHeldCart[]
+
+  /// ISO 4217 code used to show amounts (e.g. lead values). Edited from settings.
+  currency String @default("EUR")
+
+  // Taxes, edited from the organization settings.
+  /// Tax percentage suggested for new products, services and hand-typed lines.
+  defaultTaxRate  Decimal? @db.Decimal(5, 2)
+  /// Extra tax on the taxable base of sales documents and tickets, added to
+  /// the total on top of the taxes of each line.
+  totalTaxEnabled Boolean  @default(false)
+  totalTaxName    String   @default("Impuesto sobre el total")
+  totalTaxRate    Decimal? @db.Decimal(5, 2)
+
+  // Sales settings, edited from the sales module settings.
+  /// Prefix of each document number, followed by the year and a sequence.
+  salesQuotePrefix        String  @default("PRE-")
+  salesOrderPrefix        String  @default("PED-")
+  salesDeliveryNotePrefix String  @default("ALB-")
+  salesInvoicePrefix      String  @default("FAC-")
+  /// Days a new quote stays valid.
+  salesQuoteValidityDays  Int     @default(30)
+  /// Days to pay a new invoice.
+  salesInvoiceDueDays     Int     @default(30)
+  /// Conditions printed at the bottom of new documents.
+  salesDefaultTerms       String?
+  /// Delivered delivery notes take the units out of tracked stock.
+  salesStockOnDelivery    Boolean @default(true)
+
+  // Point of sale settings, edited from the point of sale module.
+  /// Prefix of the tickets (simplified invoices), a series of their own.
+  posTicketPrefix       String @default("TCK-")
+  /// Name printed on tickets sold without a customer.
+  posWalkInCustomerName String @default("Cliente de mostrador")
+
+  @@unique([slug])
+  @@map("organization")
+}
+
+model Member {
+  id             String       @id
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role           String       @default("member")
+  createdAt      DateTime
+
+  @@unique([organizationId, userId])
+  @@index([userId])
+  @@map("member")
+}
+
+model Invitation {
+  id             String       @id
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  email          String
+  role           String?
+  status         String       @default("pending")
+  expiresAt      DateTime
+  createdAt      DateTime     @default(now())
+  inviterId      String
+  inviter        User         @relation(fields: [inviterId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([email])
+  @@map("invitation")
+}
+
+model OrganizationRole {
+  id             String       @id
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  role           String
+  permission     String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime?    @updatedAt
+  label          String
+  description    String?
+
+  @@unique([organizationId, role])
+  @@map("organizationRole")
+}
+
+enum CustomerType {
+  PERSON
+  COMPANY
+}
+
+/// Customer lifecycle stages, configured per organization from its settings.
+model CustomerStatus {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  label          String
+  /// Hex color (#rrggbb) chosen from the settings color picker.
+  color          String       @default("#71717a")
+  position       Int
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  customers      Customer[]
+
+  @@index([organizationId, position])
+  @@map("customer_status")
+}
+
+model Customer {
+  id             String          @id @default(cuid())
+  organizationId String
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  type           CustomerType    @default(PERSON)
+  name           String
+  /// Company the person works for (only for PERSON customers).
+  companyName    String?
+  jobTitle       String?
+  /// Stored lowercase; unique within the organization when present.
+  email          String?
+  phone          String?
+  website        String?
+  taxId          String?
+  address        String?
+  city           String?
+  region         String?
+  postalCode     String?
+  country        String?
+  tags           String[]        @default([])
+  statusId       String?
+  status         CustomerStatus? @relation(fields: [statusId], references: [id], onDelete: SetNull)
+  ownerId        String?
+  owner          User?           @relation("CustomerOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  createdById    String?
+  createdBy      User?           @relation("CustomerCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  notes          CustomerNote[]
+  leads          Lead[]
+  salesDocuments SalesDocument[]
+  posHeldCarts   PosHeldCart[]
+
+  @@unique([organizationId, email])
+  @@index([organizationId, updatedAt])
+  @@index([organizationId, name])
+  @@index([organizationId, statusId])
+  @@index([organizationId, ownerId])
+  @@map("customer")
+}
+
+model CustomerNote {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerId     String
+  customer       Customer     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  authorId       String?
+  author         User?        @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  body           String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([customerId, createdAt])
+  @@index([organizationId])
+  @@map("customer_note")
+}
+
+/// Whether a stage keeps a lead open or closes it as won or lost.
+enum StageKind {
+  OPEN
+  WON
+  LOST
+}
+
+/// A kanban board with its own stages. Organizations can have several.
+model Pipeline {
+  id             String          @id @default(cuid())
+  organizationId String
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  description    String?
+  position       Int
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  stages         PipelineStage[]
+  leads          Lead[]
+
+  @@index([organizationId, position])
+  @@map("pipeline")
+}
+
+model PipelineStage {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  pipelineId     String
+  pipeline       Pipeline     @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  name           String
+  /// Hex color (#rrggbb) chosen from the stage color picker.
+  color          String       @default("#71717a")
+  kind           StageKind    @default(OPEN)
+  /// Chance of closing (0-100) used to weight the forecast.
+  probability    Int?
+  position       Int
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  leads          Lead[]
+
+  @@index([pipelineId, position])
+  @@map("pipeline_stage")
+}
+
+model Lead {
+  id                String        @id @default(cuid())
+  organizationId    String
+  organization      Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  pipelineId        String
+  pipeline          Pipeline      @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  stageId           String
+  stage             PipelineStage @relation(fields: [stageId], references: [id], onDelete: Restrict)
+  /// Order inside its stage column.
+  position          Int
+  title             String
+  value             Decimal?      @db.Decimal(14, 2)
+  expectedCloseDate DateTime?     @db.Date
+  contactName       String?
+  companyName       String?
+  email             String?
+  phone             String?
+  source            String?
+  lostReason        String?
+  tags              String[]      @default([])
+  customerId        String?
+  customer          Customer?     @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  ownerId           String?
+  owner             User?         @relation("LeadOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  createdById       String?
+  createdBy         User?         @relation("LeadCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  /// Set when the lead enters a won or lost stage.
+  closedAt          DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  notes             LeadNote[]
+
+  @@index([organizationId, pipelineId, stageId, position])
+  @@index([organizationId, ownerId])
+  @@index([customerId])
+  @@map("lead")
+}
+
+model LeadNote {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  leadId         String
+  lead           Lead         @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  authorId       String?
+  author         User?        @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  body           String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([leadId, createdAt])
+  @@index([organizationId])
+  @@map("lead_note")
+}
+
+/// IN adds units, OUT removes them and COUNT sets the counted stock.
+enum StockMovementType {
+  IN
+  OUT
+  COUNT
+}
+
+/// Groups of the catalog, configured per organization from its settings.
+model ProductCategory {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  /// Hex color (#rrggbb) chosen from the settings color picker.
+  color          String       @default("#71717a")
+  position       Int
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  products       Product[]
+
+  @@index([organizationId, position])
+  @@map("product_category")
+}
+
+model Product {
+  id             String                 @id @default(cuid())
+  organizationId String
+  organization   Organization           @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  /// Internal reference; unique within the organization when present.
+  sku            String?
+  /// Unique within the organization, also against presentation barcodes.
+  barcode        String?
+  description    String?
+  categoryId     String?
+  category       ProductCategory?       @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  /// Unit code from the products configuration (e.g. "unit", "hour", "kg").
+  unit           String                 @default("unit")
+  /// Sale price before taxes.
+  price          Decimal                @default(0) @db.Decimal(14, 2)
+  cost           Decimal?               @db.Decimal(14, 2)
+  /// Tax percentage (0-100) applied on top of the price.
+  taxRate        Decimal?               @db.Decimal(5, 2)
+  /// Only products with tracked stock record movements.
+  trackStock     Boolean                @default(false)
+  stock          Decimal                @default(0) @db.Decimal(14, 3)
+  /// Stock at or below this level is shown as low.
+  minStock       Decimal?               @db.Decimal(14, 3)
+  /// Inactive products stay in history but are hidden from the default list.
+  isActive       Boolean                @default(true)
+  tags           String[]               @default([])
+  /// Times other organizations created a product from this one when scanning
+  /// its barcode; ranks the suggestions.
+  copiedCount    Int                    @default(0)
+  createdById    String?
+  createdBy      User?                  @relation("ProductCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt      DateTime               @default(now())
+  updatedAt      DateTime               @updatedAt
+  movements      ProductStockMovement[]
+  presentations  ProductPresentation[]
+  images         ProductImage[]
+  salesLines     SalesDocumentLine[]
+
+  @@unique([organizationId, sku])
+  @@unique([organizationId, barcode])
+  /// Barcode suggestions look across organizations.
+  @@index([barcode])
+  @@index([organizationId, updatedAt])
+  @@index([organizationId, name])
+  @@index([organizationId, categoryId])
+  @@index([organizationId, isActive])
+  @@map("product")
+}
+
+/// Stock history of a product. Written in the same transaction as the stock.
+model ProductStockMovement {
+  id                   String            @id @default(cuid())
+  organizationId       String
+  organization         Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  productId            String
+  product              Product           @relation(fields: [productId], references: [id], onDelete: Cascade)
+  type                 StockMovementType
+  /// Signed change applied to the stock.
+  quantity             Decimal           @db.Decimal(14, 3)
+  stockAfter           Decimal           @db.Decimal(14, 3)
+  reason               String?
+  /// Presentation the movement was entered in, e.g. "Paquete de 12 ud.", and
+  /// how many of it; `quantity` is always in base units.
+  presentationLabel    String?
+  presentationQuantity Decimal?          @db.Decimal(14, 3)
+  authorId             String?
+  author               User?             @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  createdAt            DateTime          @default(now())
+
+  @@index([productId, createdAt])
+  @@index([organizationId])
+  @@map("product_stock_movement")
+}
+
+/// Another way of selling a product, e.g. a pack of 12 units, with its own
+/// price. Stock is always kept in the product's base unit.
+model ProductPresentation {
+  id             String              @id @default(cuid())
+  organizationId String
+  organization   Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  productId      String
+  product        Product             @relation(fields: [productId], references: [id], onDelete: Cascade)
+  /// Unit code from the products configuration (e.g. "pack", "box").
+  unit           String
+  /// Base units of the product it contains.
+  factor         Decimal             @db.Decimal(14, 3)
+  /// Sale price of the whole presentation before taxes.
+  price          Decimal             @db.Decimal(14, 2)
+  /// Unique within the organization, also against product barcodes.
+  barcode        String?
+  position       Int
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+  salesLines     SalesDocumentLine[]
+
+  @@unique([organizationId, barcode])
+  @@index([productId, position])
+  @@map("product_presentation")
+}
+
+/// Groups of the services catalog, configured per organization from its settings.
+model ServiceCategory {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  /// Hex color (#rrggbb) chosen from the settings color picker.
+  color          String       @default("#71717a")
+  position       Int
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  services       Service[]
+
+  @@index([organizationId, position])
+  @@map("service_category")
+}
+
+/// Work the organization sells (hours, sessions, plans…). It never keeps stock.
+model Service {
+  id              String              @id @default(cuid())
+  organizationId  String
+  organization    Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name            String
+  /// Internal reference; unique within the organization when present.
+  code            String?
+  description     String?
+  categoryId      String?
+  category        ServiceCategory?    @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  /// Unit code from the services configuration (e.g. "hour", "session").
+  unit            String              @default("hour")
+  /// Sale price per unit before taxes.
+  price           Decimal             @default(0) @db.Decimal(14, 2)
+  cost            Decimal?            @db.Decimal(14, 2)
+  /// Tax percentage (0-100) applied on top of the price.
+  taxRate         Decimal?            @db.Decimal(5, 2)
+  /// Estimated time to deliver one unit, in minutes.
+  durationMinutes Int?
+  /// Inactive services stay in history but are hidden from the default list.
+  isActive        Boolean             @default(true)
+  tags            String[]            @default([])
+  createdById     String?
+  createdBy       User?               @relation("ServiceCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  salesLines      SalesDocumentLine[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId, updatedAt])
+  @@index([organizationId, name])
+  @@index([organizationId, categoryId])
+  @@index([organizationId, isActive])
+  @@map("service")
+}
+
+/// Photo of a product stored in Cloudinary. The first one is the main image.
+model ProductImage {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  productId      String
+  product        Product      @relation(fields: [productId], references: [id], onDelete: Cascade)
+  /// Cloudinary public id, inside the folder of the product.
+  publicId       String
+  /// HTTPS delivery URL returned by Cloudinary.
+  url            String
+  width          Int
+  height         Int
+  bytes          Int
+  position       Int
+  createdAt      DateTime     @default(now())
+
+  @@index([productId, position])
+  @@index([organizationId])
+  @@map("product_image")
+}
+
+/// Steps of the sales flow. A document can start at any of them.
+enum SalesDocumentType {
+  QUOTE
+  ORDER
+  DELIVERY_NOTE
+  INVOICE
+}
+
+/// Statuses of every sales document; `config/sales.ts` sets which ones each
+/// type uses and how a document moves between them.
+enum SalesDocumentStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  REJECTED
+  CONFIRMED
+  DELIVERED
+  ISSUED
+  PAID
+  CANCELLED
+}
+
+/// Where a sales document was made.
+enum SalesChannel {
+  BACKOFFICE
+  POS
+}
+
+/// Quote, order, delivery note or invoice. Documents created from another one
+/// keep a link to it (`sourceId`), forming the chain of the sale.
+model SalesDocument {
+  id              String              @id @default(cuid())
+  organizationId  String
+  organization    Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  type            SalesDocumentType
+  status          SalesDocumentStatus @default(DRAFT)
+  /// POS documents are tickets: invoices issued and paid at the counter.
+  channel         SalesChannel        @default(BACKOFFICE)
+  /// Cash session the ticket was sold in (POS only).
+  cashSessionId   String?
+  cashSession     CashSession?        @relation(fields: [cashSessionId], references: [id], onDelete: NoAction)
+  /// Assigned on creation; invoices get it when issued, so it has no gaps.
+  number          String?
+  issueDate       DateTime            @db.Date
+  /// Valid until (quotes), delivery date (orders) or due date (invoices).
+  dueDate         DateTime?           @db.Date
+  customerId      String?
+  customer        Customer?           @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  // Customer data copied when the document is saved, so it stays as issued.
+  customerName    String
+  customerTaxId   String?
+  customerEmail   String?
+  customerAddress String?
+  /// How the goods reach the customer: "shipping" or "pickup" (see
+  /// `config/sales.ts`); null for types without delivery (invoices).
+  deliveryMethod  String?
+  /// Where to ship; starts as the customer's address but can be another one.
+  shippingAddress String?
+  /// Customer's own reference, e.g. their purchase order number.
+  reference       String?
+  /// Conditions shown on the document.
+  terms           String?
+  /// Only visible to the team.
+  internalNotes   String?
+  currency        String
+  subtotal        Decimal             @default(0) @db.Decimal(14, 2)
+  discountTotal   Decimal             @default(0) @db.Decimal(14, 2)
+  taxTotal        Decimal             @default(0) @db.Decimal(14, 2)
+  /// Tax on the total (organization setting when the totals were computed);
+  /// null when it did not apply. `total` already includes its amount.
+  totalTaxName    String?
+  totalTaxRate    Decimal?            @db.Decimal(5, 2)
+  totalTaxAmount  Decimal             @default(0) @db.Decimal(14, 2)
+  total           Decimal             @default(0) @db.Decimal(14, 2)
+  /// Sum of the payments (invoices).
+  paidTotal       Decimal             @default(0) @db.Decimal(14, 2)
+  /// Whether the units of a delivered delivery note left the stock.
+  stockApplied    Boolean             @default(false)
+  sourceId        String?
+  source          SalesDocument?      @relation("SalesDocumentSource", fields: [sourceId], references: [id], onDelete: SetNull)
+  derived         SalesDocument[]     @relation("SalesDocumentSource")
+  posHeldCarts    PosHeldCart[]
+  ownerId         String?
+  owner           User?               @relation("SalesOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  createdById     String?
+  createdBy       User?               @relation("SalesCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  statusChangedAt DateTime            @default(now())
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  lines           SalesDocumentLine[]
+  payments        SalesPayment[]
+
+  @@unique([organizationId, type, number])
+  @@index([organizationId, type, updatedAt])
+  @@index([organizationId, type, status])
+  @@index([organizationId, type, issueDate])
+  @@index([customerId])
+  @@index([sourceId])
+  @@index([cashSessionId])
+  @@map("sales_document")
+}
+
+model SalesDocumentLine {
+  id                String               @id @default(cuid())
+  organizationId    String
+  organization      Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  documentId        String
+  document          SalesDocument        @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  position          Int
+  productId         String?
+  product           Product?             @relation(fields: [productId], references: [id], onDelete: SetNull)
+  serviceId         String?
+  service           Service?             @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  description       String
+  /// Unit code of the product or service, or empty for free lines.
+  unit              String?
+  /// Presentation of the product sold (e.g. a pack of 12); null for its base
+  /// unit. The label and factor are kept in case the presentation changes.
+  presentationId    String?
+  presentation      ProductPresentation? @relation(fields: [presentationId], references: [id], onDelete: SetNull)
+  presentationLabel String?
+  /// Base units of the product in one unit of the line (1 without presentation).
+  unitFactor        Decimal              @default(1) @db.Decimal(14, 3)
+  quantity          Decimal              @db.Decimal(14, 3)
+  unitPrice         Decimal              @db.Decimal(14, 2)
+  /// Discount percentage (0-100) on the line.
+  discount          Decimal              @default(0) @db.Decimal(5, 2)
+  taxRate           Decimal              @default(0) @db.Decimal(5, 2)
+  /// Amount after the discount and before taxes.
+  subtotal          Decimal              @db.Decimal(14, 2)
+  taxAmount         Decimal              @db.Decimal(14, 2)
+  total             Decimal              @db.Decimal(14, 2)
+
+  @@index([documentId, position])
+  @@index([organizationId])
+  @@index([productId])
+  @@index([serviceId])
+  @@index([presentationId])
+  @@map("sales_document_line")
+}
+
+/// Money received for an invoice. Negative amounts are refunds of voided
+/// tickets.
+model SalesPayment {
+  id              String        @id @default(cuid())
+  organizationId  String
+  organization    Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  documentId      String
+  document        SalesDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  amount          Decimal       @db.Decimal(14, 2)
+  paidOn          DateTime      @db.Date
+  paymentMethodId String
+  paymentMethod   PaymentMethod @relation(fields: [paymentMethodId], references: [id], onDelete: NoAction)
+  /// Cash handed over by the customer (cash payments at the counter).
+  tendered        Decimal?      @db.Decimal(14, 2)
+  /// Cash session the money went into, so it counts in its cash count.
+  cashSessionId   String?
+  cashSession     CashSession?  @relation(fields: [cashSessionId], references: [id], onDelete: NoAction)
+  note            String?
+  authorId        String?
+  author          User?         @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  createdAt       DateTime      @default(now())
+
+  @@index([documentId, paidOn])
+  @@index([organizationId])
+  @@index([cashSessionId])
+  @@index([paymentMethodId])
+  @@map("sales_payment")
+}
+
+/// Last number used by each document type, series and year, to number
+/// without gaps. Tickets are invoices with the series "POS".
+model SalesCounter {
+  organizationId String
+  organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  type           SalesDocumentType
+  series         String            @default("")
+  year           Int
+  lastNumber     Int               @default(0)
+
+  @@id([organizationId, type, series, year])
+  @@map("sales_counter")
+}
+
+/// How money arrives (cash, card, transfer…), configured per organization.
+/// Cash methods count in the cash drawer of the point of sale.
+enum PaymentMethodKind {
+  CASH
+  CARD
+  TRANSFER
+  OTHER
+}
+
+model PaymentMethod {
+  id             String            @id @default(cuid())
+  organizationId String
+  organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  kind           PaymentMethodKind @default(OTHER)
+  /// Inactive methods stay in history but cannot receive new payments.
+  isActive       Boolean           @default(true)
+  position       Int
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  payments       SalesPayment[]
+
+  @@index([organizationId, position])
+  @@map("payment_method")
+}
+
+/// A till of the point of sale, e.g. "Caja 1". Opened and closed in sessions.
+model CashRegister {
+  id             String        @id @default(cuid())
+  organizationId String
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  isActive       Boolean       @default(true)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  sessions       CashSession[]
+  heldCarts      PosHeldCart[]
+
+  @@unique([organizationId, name])
+  @@map("cash_register")
+}
+
+enum CashSessionStatus {
+  OPEN
+  CLOSED
+}
+
+/// From the opening of a register to its cash count. A register and a person
+/// have at most one open session (partial unique indexes in the migration).
+model CashSession {
+  id             String            @id @default(cuid())
+  organizationId String
+  organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  registerId     String
+  register       CashRegister      @relation(fields: [registerId], references: [id], onDelete: NoAction)
+  status         CashSessionStatus @default(OPEN)
+  openedById     String?
+  openedBy       User?             @relation("CashSessionOpener", fields: [openedById], references: [id], onDelete: SetNull)
+  openedAt       DateTime          @default(now())
+  /// Cash in the drawer when it was opened.
+  openingAmount  Decimal           @db.Decimal(14, 2)
+  closedById     String?
+  closedBy       User?             @relation("CashSessionCloser", fields: [closedById], references: [id], onDelete: SetNull)
+  closedAt       DateTime?
+  /// Cash that should be in the drawer at closing, computed then.
+  expectedCash   Decimal?          @db.Decimal(14, 2)
+  /// Cash counted at closing.
+  countedCash    Decimal?          @db.Decimal(14, 2)
+  /// counted - expected: negative when cash is missing.
+  difference     Decimal?          @db.Decimal(14, 2)
+  closingNotes   String?
+  documents      SalesDocument[]
+  payments       SalesPayment[]
+  movements      CashMovement[]
+
+  @@index([organizationId, openedAt])
+  @@index([registerId, status])
+  @@map("cash_session")
+}
+
+enum CashMovementType {
+  IN
+  OUT
+}
+
+/// Cash put in or taken out of the drawer by hand, e.g. change or a small
+/// expense.
+model CashMovement {
+  id             String           @id @default(cuid())
+  organizationId String
+  organization   Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  sessionId      String
+  session        CashSession      @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  type           CashMovementType
+  amount         Decimal          @db.Decimal(14, 2)
+  reason         String
+  authorId       String?
+  author         User?            @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  createdAt      DateTime         @default(now())
+
+  @@index([sessionId, createdAt])
+  @@index([organizationId])
+  @@map("cash_movement")
+}
+
+/// Cart parked at the till to charge it later, from any register of the
+/// organization. Recovering it moves it back to a till and deletes it.
+model PosHeldCart {
+  id             String         @id @default(cuid())
+  organizationId String
+  organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  /// Short note to find it again, e.g. "Mesa 3" or "Vuelve a las 5".
+  note           String?
+  customerId     String?
+  customer       Customer?      @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  /// Register whose till saved it; listed first there.
+  registerId     String?
+  /// Whether other registers can see and recover it; when false only its
+  /// register (and point of sale managers) can.
+  isShared       Boolean        @default(true)
+  register       CashRegister?  @relation(fields: [registerId], references: [id], onDelete: SetNull)
+  /// Quote or order loaded in the cart, if any.
+  sourceId       String?
+  source         SalesDocument? @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  /// Lines as typed at the till (the cart form values).
+  lines          Json
+  itemCount      Int
+  /// Total when it was saved; the ticket is recomputed when charged.
+  total          Decimal        @db.Decimal(14, 2)
+  createdById    String?
+  createdBy      User?          @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt      DateTime       @default(now())
+
+  @@index([organizationId, createdAt])
+  @@map("pos_held_cart")
+}
