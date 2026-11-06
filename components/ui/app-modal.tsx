@@ -9,8 +9,11 @@ export interface AppModalProps {
   description?: string;
   children?: React.ReactNode;
   footer?: React.ReactNode;
-  /** "lg" for forms with several fields per row. */
-  size?: "md" | "lg";
+  /**
+   * "lg" for forms with several fields per row; "xl" for a whole page form
+   * (e.g. a new product) opened without leaving the screen, scrolling inside.
+   */
+  size?: "md" | "lg" | "xl";
 }
 
 export function AppModal({
@@ -24,8 +27,16 @@ export function AppModal({
 }: AppModalProps) {
   return (
     <Modal.Backdrop isOpen={isOpen} onOpenChange={onOpenChange}>
-      <Modal.Container>
-        <Modal.Dialog className={size === "lg" ? "sm:max-w-xl" : "sm:max-w-md"}>
+      <Modal.Container scroll={size === "xl" ? "inside" : undefined}>
+        <Modal.Dialog
+          className={
+            size === "xl"
+              ? "sm:max-w-6xl"
+              : size === "lg"
+                ? "sm:max-w-xl"
+                : "sm:max-w-md"
+          }
+        >
           <Modal.CloseTrigger />
           <Modal.Header className="flex flex-col items-start gap-1">
             <Modal.Heading>{title}</Modal.Heading>

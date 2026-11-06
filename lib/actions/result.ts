@@ -1,8 +1,47 @@
 import { APIError } from "better-auth/api";
 import { z } from "zod";
 
+import { APP_LOCALE } from "@/config/organization";
+import { unitInfo } from "@/config/products";
+
 export type ActionResult<T = undefined> =
-  { ok: true; data: T } | { ok: false; error: string };
+  | { ok: true; data: T }
+  | { ok: false; error: string; stockShortages?: StockShortage[] };
+
+/** A product whose tracked stock does not cover what is being taken out. */
+export interface StockShortage {
+  productId: string;
+  name: string;
+  /** Base unit of the product, e.g. "unit" or "kg". */
+  unit: string;
+  /** Base units the operation needs. */
+  requested: number;
+  /** Base units in stock right now. */
+  available: number;
+}
+
+/**
+ * Thrown when an operation would leave products with negative stock. The
+ * result lists every product short of stock so the UI can link to each one.
+ */
+export class InsufficientStockError extends Error {
+  constructor(readonly shortages: StockShortage[]) {
+    super("INSUFFICIENT_STOCK");
+  }
+}
+
+const quantityFormatter = new Intl.NumberFormat(APP_LOCALE, {
+  maximumFractionDigits: 3,
+});
+
+const shortageText = (shortages: StockShortage[]) =>
+  shortages
+    .map((item) => {
+      const unit = unitInfo(item.unit).short;
+
+      return `${item.name} (hay ${quantityFormatter.format(item.available)} ${unit}, se necesitan ${quantityFormatter.format(item.requested)} ${unit})`;
+    })
+    .join("; ");
 
 const errorMessages: Record<string, string> = {
   CANNOT_GRANT_OWNER_ROLE:
@@ -205,6 +244,13 @@ export async function runAction<S extends z.ZodType, T>(
   try {
     return { ok: true, data: await fn(parsed.data) };
   } catch (error) {
+    if (error instanceof InsufficientStockError) {
+      return {
+        ok: false,
+        error: `No hay stock suficiente: ${shortageText(error.shortages)}.`,
+        stockShortages: error.shortages,
+      };
+    }
     if (error instanceof APIError) {
       if (error.status === "UNAUTHORIZED") {
         return {

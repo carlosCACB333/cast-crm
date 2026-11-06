@@ -61,7 +61,12 @@ export {
   type AppKanbanMove,
   type AppKanbanProps,
 } from "./app-kanban";
-export { AppLink, type AppLinkProps } from "./app-link";
+export {
+  AppIconLink,
+  type AppIconLinkProps,
+  AppLink,
+  type AppLinkProps,
+} from "./app-link";
 export { AppModal, type AppModalProps } from "./app-modal";
 export { AppPagination, type AppPaginationProps } from "./app-pagination";
 export { AppSearchInput, type AppSearchInputProps } from "./app-search-input";

@@ -341,7 +341,11 @@ export async function setSalesDocumentStatus(
         };
 
         if (status === "DELIVERED" && settings.stockOnDelivery) {
-          await applyDeliveryStock(tx, { ...stock, direction: "out" });
+          await applyDeliveryStock(tx, {
+            ...stock,
+            direction: "out",
+            allowNegativeStock: settings.allowNegativeStock,
+          });
           stockApplied = true;
         } else if (status !== "DELIVERED" && stockApplied) {
           await applyDeliveryStock(tx, { ...stock, direction: "in" });
@@ -813,6 +817,7 @@ export async function updateSalesSettings(
         salesInvoiceDueDays: Number(values.invoiceDueDays),
         salesDefaultTerms: emptyToNull(values.defaultTerms),
         salesStockOnDelivery: values.stockOnDelivery,
+        salesAllowNegativeStock: values.allowNegativeStock,
       },
     });
 

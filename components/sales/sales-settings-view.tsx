@@ -143,6 +143,13 @@ function SalesSettingsForm({
           label="Descontar stock al entregar albaranes"
           name="stockOnDelivery"
         />
+        <AppSwitch
+          control={control}
+          description="Si está activo, los tickets y albaranes se registran aunque falte stock y este queda en negativo. Si no, la venta se bloquea e indica qué productos no tienen stock suficiente."
+          isDisabled={!canEdit}
+          label="Permitir vender sin stock suficiente"
+          name="allowNegativeStock"
+        />
       </AppCard>
 
       {canEdit ? (
@@ -193,6 +200,7 @@ export function SalesSettingsView() {
             invoiceDueDays: String(data.invoiceDueDays),
             defaultTerms: data.defaultTerms ?? "",
             stockOnDelivery: data.stockOnDelivery,
+            allowNegativeStock: data.allowNegativeStock,
           }}
         />
       ) : (

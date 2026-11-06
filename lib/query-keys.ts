@@ -58,6 +58,10 @@ export const queryKeys = {
   productCategories: ["products", "categories"] as const,
   productCategoryOptions: ["products", "categories", "options"] as const,
   productTagOptions: ["products", "tags", "options"] as const,
+  // Under the products so any stock change refreshes the warning of the till.
+  posStockChecks: ["products", "pos-stock-check"] as const,
+  posStockCheck: (lines: readonly unknown[]) =>
+    ["products", "pos-stock-check", lines] as const,
   services: ["services"] as const,
   serviceList: (filters: Record<string, unknown>) =>
     ["services", "list", filters] as const,

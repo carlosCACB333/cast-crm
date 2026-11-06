@@ -194,6 +194,19 @@ export const posCartSchema = z.object({
     .max(SALES_LIMITS.maxLines, `Máximo ${SALES_LIMITS.maxLines} líneas`),
 });
 
+/** Lines of the cart whose stock is checked before charging. */
+export const posStockCheckSchema = z.object({
+  lines: z
+    .array(
+      salesLineSchema.pick({
+        itemRef: true,
+        presentationId: true,
+        quantity: true,
+      }),
+    )
+    .max(SALES_LIMITS.maxLines),
+});
+
 export const posCheckoutFormSchema = z.object({
   payments: z
     .array(posPaymentSchema)
@@ -288,6 +301,7 @@ export type CloseCashSessionFormValues = z.infer<
 >;
 export type PosPaymentValues = z.infer<typeof posPaymentSchema>;
 export type PosCartValues = z.infer<typeof posCartSchema>;
+export type PosStockCheckInput = z.infer<typeof posStockCheckSchema>;
 export type HoldPosCartFormValues = z.infer<typeof holdPosCartFormSchema>;
 export type PosCheckoutFormValues = z.infer<typeof posCheckoutFormSchema>;
 export type CollectInvoiceFormValues = z.infer<typeof collectInvoiceFormSchema>;

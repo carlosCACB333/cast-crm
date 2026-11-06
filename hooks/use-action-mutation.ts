@@ -1,11 +1,21 @@
 "use client";
 
-import type { ActionResult } from "@/lib/actions/result";
+import type { ActionResult, StockShortage } from "@/lib/actions/result";
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { notify } from "@/components/ui";
 import { queryKeys } from "@/lib/query-keys";
+
+/** A failed action, with the products short of stock when that was why. */
+export class ActionError extends Error {
+  constructor(
+    message: string,
+    readonly stockShortages?: StockShortage[],
+  ) {
+    super(message);
+  }
+}
 
 interface Options {
   successMessage?: string;
@@ -24,7 +34,9 @@ export function useActionMutation<TInput, TData>(
     mutationFn: async (input: TInput) => {
       const result = await action(input);
 
-      if (!result.ok) throw new Error(result.error);
+      if (!result.ok) {
+        throw new ActionError(result.error, result.stockShortages);
+      }
 
       return result.data;
     },

@@ -1,6 +1,8 @@
 "use client";
 
 import type { BarcodeSuggestion } from "@/lib/actions/products";
+import type { ProductFormValues } from "@/lib/validations/products";
+import type { UseFormReturn } from "react-hook-form";
 
 import clsx from "clsx";
 
@@ -9,9 +11,52 @@ import {
   priceWithTax,
 } from "@/components/products/product-format";
 import { AppAlert, AppButton, AppLink, AppSkeleton } from "@/components/ui";
-import { unitInfo } from "@/config/products";
+import {
+  PRODUCT_LIMITS,
+  PRODUCT_UNIT_CODES,
+  unitInfo,
+} from "@/config/products";
 import { useMoneyFormatter } from "@/hooks/use-preferences";
 import { useBarcodeLookup } from "@/hooks/use-products";
+import { decimalToText } from "@/lib/pricing";
+
+const toUnit = (code: string, fallback: ProductFormValues["unit"]) =>
+  PRODUCT_UNIT_CODES.find((unit) => unit === code) ?? fallback;
+
+/** Fills a product form from a suggestion, except stock and internal codes. */
+export function applyBarcodeSuggestion(
+  {
+    getValues,
+    setValue,
+  }: Pick<UseFormReturn<ProductFormValues>, "getValues" | "setValue">,
+  suggestion: BarcodeSuggestion,
+) {
+  const options = { shouldDirty: true, shouldValidate: true };
+  const unit = toUnit(suggestion.unit, getValues("unit"));
+
+  setValue("name", suggestion.name, options);
+  setValue("description", suggestion.description ?? "", options);
+  setValue("unit", unit, options);
+  setValue("price", decimalToText(suggestion.price), options);
+  if (suggestion.taxRate !== null) {
+    setValue("taxRate", decimalToText(suggestion.taxRate), options);
+  }
+  if (suggestion.categoryId) {
+    setValue("categoryId", suggestion.categoryId, options);
+  }
+  setValue("tags", suggestion.tags.slice(0, PRODUCT_LIMITS.maxTags), options);
+  setValue("trackStock", suggestion.trackStock, options);
+  setValue(
+    "presentations",
+    suggestion.presentations.map((presentation) => ({
+      unit: toUnit(presentation.unit, unit),
+      factor: decimalToText(presentation.factor),
+      price: decimalToText(presentation.price),
+      barcode: presentation.barcode ?? "",
+    })),
+    options,
+  );
+}
 
 /**
  * Result of looking up the barcode of a new product: the product the

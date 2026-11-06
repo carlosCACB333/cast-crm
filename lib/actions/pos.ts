@@ -12,7 +12,11 @@ import { APIError } from "better-auth/api";
 import { z } from "zod";
 
 import { getActorContext, requirePermission } from "@/lib/actions/context";
-import { type ActionResult, runAction } from "@/lib/actions/result";
+import {
+  type ActionResult,
+  type StockShortage,
+  runAction,
+} from "@/lib/actions/result";
 import {
   presentationLabel,
   unitInfo as productUnitInfo,
@@ -43,6 +47,7 @@ import {
   buildLines,
   createInvoicePayment,
   customerSnapshot,
+  findCartStockShortages,
   findSalesDocumentOrThrow,
   getSalesSettings,
   resolvePaymentMethods,
@@ -73,6 +78,7 @@ import {
   posCartSchema,
   posItemsSchema,
   posSettingsSchema,
+  posStockCheckSchema,
   reportCashDiscrepancySchema,
   updateCashRegisterSchema,
 } from "@/lib/validations/pos";
@@ -134,6 +140,7 @@ async function findPosState(organizationId: string, userId: string) {
       defaultTaxRate: sales.defaultTaxRate,
       totalTax: sales.totalTax,
       stockOnSale: sales.stockOnDelivery,
+      allowNegativeStock: sales.allowNegativeStock,
     },
     paymentMethods,
     heldCartCount,
@@ -633,6 +640,20 @@ export async function deleteHeldCart(id: unknown): Promise<ActionResult> {
   });
 }
 
+/**
+ * Products of the cart whose stock does not cover it, to warn before
+ * charging. Only a hint: the sale checks the stock again when it is made.
+ */
+export async function checkPosStock(
+  input: unknown,
+): Promise<ActionResult<StockShortage[]>> {
+  return runAction(posStockCheckSchema, input, async ({ lines }) => {
+    const { organizationId } = await requirePermission({ pos: ["sell"] });
+
+    return findCartStockShortages(organizationId, lines);
+  });
+}
+
 /** What a quote or order becomes once it is charged at the till. */
 const SOURCE_STATUS_ON_SALE: Partial<
   Record<SalesDocumentType, { from: readonly SalesStatus[]; to: SalesStatus }>
@@ -750,6 +771,7 @@ export async function createPosTicket(
           number,
           authorId: userId,
           direction: "out",
+          allowNegativeStock: settings.allowNegativeStock,
           reason: `Ticket ${number}`,
         });
         await tx.salesDocument.update({

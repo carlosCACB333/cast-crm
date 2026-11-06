@@ -156,6 +156,8 @@ model Organization {
   salesDefaultTerms       String?
   /// Delivered delivery notes take the units out of tracked stock.
   salesStockOnDelivery    Boolean @default(true)
+  /// Sales (tickets and delivery notes) may leave tracked stock below zero.
+  salesAllowNegativeStock Boolean @default(false)
 
   // Point of sale settings, edited from the point of sale module.
   /// Prefix of the tickets (simplified invoices), a series of their own.

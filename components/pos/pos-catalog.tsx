@@ -2,12 +2,22 @@
 
 import type { PosItem } from "@/lib/actions/pos";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
 
 import { CatalogThumb } from "@/components/catalog/catalog-thumb";
 import { PosPresentationModal } from "@/components/pos/pos-presentation-modal";
-import { BriefcaseIcon, PackageIcon, SearchIcon } from "@/components/icons";
+import {
+  type CreatedProduct,
+  ProductCreateModal,
+} from "@/components/products/product-form";
+import {
+  BriefcaseIcon,
+  PackageIcon,
+  PlusIcon,
+  SearchIcon,
+} from "@/components/icons";
 import { QueryError } from "@/components/organization/query-state";
 import {
   AppButton,
@@ -15,12 +25,37 @@ import {
   AppSearchInput,
   AppSkeleton,
 } from "@/components/ui";
-import { usePosItems } from "@/hooks/use-pos";
+import { usePermission } from "@/hooks/use-organization";
+import { posItemsQuery, usePosItems } from "@/hooks/use-pos";
 import { useMoneyFormatter } from "@/hooks/use-preferences";
 import { lineAmounts } from "@/lib/sales-math";
 import { SALES_BASE_PRESENTATION } from "@/lib/validations/sales";
+import { unitInfo } from "@/config/products";
+import { parseTypedDecimal } from "@/lib/pricing";
 
 type Kind = "" | "product" | "service";
+
+/** A product just created from the till, as its catalog would list it. */
+function toPosItem({ id, values }: CreatedProduct): PosItem {
+  return {
+    ref: `product:${id}`,
+    kind: "product",
+    name: values.name,
+    code: values.sku || null,
+    barcode: values.barcode || null,
+    unit: unitInfo(values.unit).short,
+    unitPrice: parseTypedDecimal(values.price) ?? 0,
+    taxRate: parseTypedDecimal(values.taxRate),
+    stock: null,
+    color: null,
+    imageUrl: null,
+    presentations: [],
+    matchedPresentationId: null,
+  };
+}
+
+/** Searches that look like a barcode (only digits, EAN/UPC length or so). */
+const BARCODE_PATTERN = /^\d{6,14}$/;
 
 const KINDS: { kind: Kind; label: string }[] = [
   { kind: "", label: "Todo" },
@@ -29,10 +64,31 @@ const KINDS: { kind: Kind; label: string }[] = [
 ];
 
 /**
+ * The only item whose barcode (or that of one of its presentations) is
+ * exactly the search, with what it sells: the scanned presentation, or the
+ * base unit for the product's own barcode. Null when none or several match.
+ */
+function exactMatch(items: PosItem[], q: string) {
+  const matches = items.filter(
+    (item) => item.matchedPresentationId || item.barcode === q,
+  );
+
+  if (matches.length !== 1) return null;
+  const [item] = matches;
+
+  return {
+    item,
+    presentationId:
+      item.matchedPresentationId ??
+      (item.presentations.length ? SALES_BASE_PRESENTATION : ""),
+  };
+}
+
+/**
  * Catalog grid of the till: tap an item to add it to the ticket; products sold
- * in several presentations ask which one. A barcode scanner types the code
- * and Enter; an exact match (of a product or one of its presentations) is
- * added right away.
+ * in several presentations ask which one. A search that is exactly the
+ * barcode of a single item (or of one of its presentations) adds it right
+ * away, so a scanner needs nothing else; any other search just filters.
  */
 export function PosCatalog({
   defaultTaxRate,
@@ -49,10 +105,37 @@ export function PosCatalog({
   const [picking, setPicking] = useState<PosItem>();
   const items = usePosItems({ q, kind, page });
   const data = items.data;
+  const queryClient = useQueryClient();
+  // Latest search, to ignore results of one already replaced.
+  const latestQ = useRef("");
+  // Empties the search box after a scan, even when its value did not change.
+  const [scanCount, setScanCount] = useState(0);
+  const canCreateProduct = usePermission({ product: ["create"] });
+  // What was searched when creating a product that was not found.
+  const [creating, setCreating] = useState<string>();
 
-  const search = (value: string) => {
+  const clearSearch = () => {
+    latestQ.current = "";
+    setQ("");
+    setPage(1);
+    setScanCount((count) => count + 1);
+  };
+
+  const search = async (value: string) => {
+    latestQ.current = value;
     setQ(value);
     setPage(1);
+    if (!value) return;
+
+    // Same request as the grid: an exact match goes straight to the cart.
+    const result = await queryClient
+      .fetchQuery(posItemsQuery({ q: value, kind, page: 1 }))
+      .catch(() => null);
+    const match = result && exactMatch(result.items, value);
+
+    if (!match || latestQ.current !== value) return;
+    onAdd(match.item, match.presentationId);
+    clearSearch();
   };
 
   /** Adds the item, asking for the presentation when it has several. */
@@ -61,25 +144,13 @@ export function PosCatalog({
     else onAdd(item, "");
   };
 
-  // Scanners end with Enter: add the item whose barcode or code matches.
+  // Enter searches at once (scanners end with it) or adds the only result.
   const onKeyDown = (event: React.KeyboardEvent) => {
-    if (event.key !== "Enter" || !data) return;
+    if (event.key !== "Enter") return;
     const typed = (event.target as HTMLInputElement).value.trim();
-    const presentationMatch = data.items.find(
-      (item) => item.matchedPresentationId,
-    );
-    const match = data.items.find(
-      (item) => item.barcode === typed || item.code === typed,
-    );
 
-    if (presentationMatch?.matchedPresentationId && typed === q) {
-      onAdd(presentationMatch, presentationMatch.matchedPresentationId);
-      search("");
-    } else if (match) {
-      // The product's own barcode is its base unit.
-      onAdd(match, match.presentations.length ? SALES_BASE_PRESENTATION : "");
-      search("");
-    } else if (data.items.length === 1 && typed === q) {
+    if (typed !== q) search(typed);
+    else if (data?.items.length === 1 && !items.isPlaceholderData) {
       pick(data.items[0]);
       search("");
     }
@@ -94,6 +165,7 @@ export function PosCatalog({
             debounceMs={250}
             label="Buscar en el catálogo"
             placeholder="Nombre, referencia o código de barras"
+            resetKey={scanCount}
             value={q}
             onChange={search}
           />
@@ -129,9 +201,19 @@ export function PosCatalog({
         </div>
       ) : data.items.length === 0 ? (
         <AppEmptyState
+          action={
+            q && canCreateProduct ? (
+              <AppButton variant="secondary" onPress={() => setCreating(q)}>
+                <PlusIcon size={16} />
+                Crear producto
+              </AppButton>
+            ) : undefined
+          }
           description={
             q
-              ? "Prueba con otro nombre o código."
+              ? canCreateProduct
+                ? "Prueba con otro nombre o código, o créalo ahora y se añadirá al ticket."
+                : "Prueba con otro nombre o código."
               : "Crea productos o servicios activos para venderlos aquí."
           }
           icon={<SearchIcon size={20} />}
@@ -221,6 +303,27 @@ export function PosCatalog({
           ) : null}
         </>
       )}
+      {creating !== undefined ? (
+        <ProductCreateModal
+          initial={
+            BARCODE_PATTERN.test(creating)
+              ? { barcode: creating }
+              : { name: creating }
+          }
+          onClose={() => setCreating(undefined)}
+          onCreated={(product) => {
+            // Sold in its base unit; other presentations are picked later.
+            onAdd(
+              toPosItem(product),
+              product.values.presentations.length
+                ? SALES_BASE_PRESENTATION
+                : "",
+            );
+            clearSearch();
+            setCreating(undefined);
+          }}
+        />
+      ) : null}
       {picking ? (
         <PosPresentationModal
           item={picking}

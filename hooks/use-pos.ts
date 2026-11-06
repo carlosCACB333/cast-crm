@@ -6,6 +6,7 @@ import type {
   CashRegisterListParams,
   CashSessionListParams,
   PosItemsInput,
+  PosStockCheckInput,
 } from "@/lib/validations/pos";
 
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
@@ -22,6 +23,7 @@ import {
   listCashRegisters,
   listCashSessions,
   listHeldCarts,
+  checkPosStock,
   searchPosItems,
 } from "@/lib/actions/pos";
 import { queryKeys } from "@/lib/query-keys";
@@ -44,13 +46,32 @@ export function useHeldCarts({ enabled = true }: { enabled?: boolean } = {}) {
   });
 }
 
+/** Query of one page of the catalog grid, also fetched when scanning. */
+export const posItemsQuery = (params: PosItemsInput) => ({
+  queryKey: queryKeys.posItems(params),
+  queryFn: () => unwrapAction(searchPosItems(params)),
+  staleTime: 30_000,
+});
+
 /** One page of the catalog grid of the till. */
 export function usePosItems(params: PosItemsInput) {
   return useQuery({
-    queryKey: queryKeys.posItems(params),
-    queryFn: () => unwrapAction(searchPosItems(params)),
+    ...posItemsQuery(params),
     placeholderData: keepPreviousData,
-    staleTime: 30_000,
+  });
+}
+
+/**
+ * Products of the cart without enough stock. A warning only: the sale
+ * validates the stock again on the server.
+ */
+export function usePosStockCheck(lines: PosStockCheckInput["lines"]) {
+  return useQuery({
+    queryKey: queryKeys.posStockCheck(lines),
+    queryFn: () => unwrapAction(checkPosStock({ lines })),
+    enabled: lines.length > 0,
+    placeholderData: keepPreviousData,
+    staleTime: 15_000,
   });
 }
 

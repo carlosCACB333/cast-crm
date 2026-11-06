@@ -15,7 +15,10 @@ import {
 } from "@/components/catalog/catalog-page";
 import { PricePreview } from "@/components/catalog/price-preview";
 import { PageHeader } from "@/components/page-header";
-import { BarcodeSuggestions } from "@/components/products/barcode-suggestions";
+import {
+  BarcodeSuggestions,
+  applyBarcodeSuggestion,
+} from "@/components/products/barcode-suggestions";
 import {
   ProductThumb,
   formatQuantity,
@@ -29,17 +32,13 @@ import {
   AppCard,
   AppEmptyState,
   AppInput,
+  AppModal,
   AppSwitch,
   AppTagInput,
   AppTextarea,
   notify,
 } from "@/components/ui";
-import {
-  PRODUCT_LIMITS,
-  PRODUCT_UNIT_CODES,
-  PRODUCT_UNITS,
-  unitInfo,
-} from "@/config/products";
+import { PRODUCT_LIMITS, PRODUCT_UNITS, unitInfo } from "@/config/products";
 import { useActionMutation } from "@/hooks/use-action-mutation";
 import { useMyAccess, usePermission } from "@/hooks/use-organization";
 import {
@@ -62,9 +61,6 @@ const FORM_ID = "product-form";
 
 /** Wait after the last keystroke before looking up a typed barcode. */
 const BARCODE_LOOKUP_DELAY_MS = 400;
-
-const toUnit = (code: string, fallback: ProductFormValues["unit"]) =>
-  PRODUCT_UNIT_CODES.find((unit) => unit === code) ?? fallback;
 
 function toFormValues(product: ProductDetail): ProductFormValues {
   return {
@@ -156,7 +152,27 @@ function ProductSummary({
   );
 }
 
-function ProductForm({ product }: { product?: ProductDetail }) {
+/** A product created from a modal, handed back to the screen that opened it. */
+export interface CreatedProduct {
+  id: string;
+  values: ProductFormValues;
+}
+
+interface ProductFormModal {
+  /** What is already known, e.g. the barcode that was searched. */
+  initial?: Partial<ProductFormValues>;
+  onCreated: (product: CreatedProduct) => void;
+  onClose: () => void;
+}
+
+function ProductForm({
+  product,
+  modal,
+}: {
+  product?: ProductDetail;
+  /** Creates the product in a modal over the current screen, not a page. */
+  modal?: ProductFormModal;
+}) {
   const router = useRouter();
   const money = useMoneyFormatter();
   const isEdit = Boolean(product);
@@ -164,7 +180,8 @@ function ProductForm({ product }: { product?: ProductDetail }) {
 
   const create = useActionMutation(createProduct, {
     successMessage: "Producto creado",
-    invalidate,
+    // The till lists new products in its catalog too.
+    invalidate: [...invalidate, queryKeys.pos],
   });
   const update = useActionMutation(updateProduct, {
     successMessage: "Cambios guardados",
@@ -182,7 +199,9 @@ function ProductForm({ product }: { product?: ProductDetail }) {
     formState: { isDirty, isSubmitSuccessful },
   } = useForm<ProductFormValues>({
     resolver: zodResolver(productFormSchema),
-    defaultValues: product ? toFormValues(product) : EMPTY_PRODUCT_FORM,
+    defaultValues: product
+      ? toFormValues(product)
+      : { ...EMPTY_PRODUCT_FORM, ...modal?.initial },
   });
   const values = useWatch({ control }) as ProductFormValues;
   const { trackStock, price, taxRate, cost } = values;
@@ -197,7 +216,8 @@ function ProductForm({ product }: { product?: ProductDetail }) {
     }
   }, [product, defaultTaxRate, getFieldState, resetField]);
 
-  useUnsavedChangesWarning(hasUnsavedChanges);
+  // A modal is closed on purpose; the warning guards page navigation.
+  useUnsavedChangesWarning(hasUnsavedChanges && !modal);
 
   // New products start from the barcode: a scanner types it and presses
   // Enter, which looks it up at once; typed codes are looked up after a pause.
@@ -221,33 +241,8 @@ function ProductForm({ product }: { product?: ProductDetail }) {
   // The suggestion only counts while the code it was found with is kept.
   const sourceId = source && source.barcode === barcode ? source.id : null;
 
-  /** Fills the form from a suggestion, except stock and internal codes. */
   const applySuggestion = (suggestion: BarcodeSuggestion) => {
-    const options = { shouldDirty: true, shouldValidate: true };
-    const unit = toUnit(suggestion.unit, getValues("unit"));
-
-    setValue("name", suggestion.name, options);
-    setValue("description", suggestion.description ?? "", options);
-    setValue("unit", unit, options);
-    setValue("price", decimalToText(suggestion.price), options);
-    if (suggestion.taxRate !== null) {
-      setValue("taxRate", decimalToText(suggestion.taxRate), options);
-    }
-    if (suggestion.categoryId) {
-      setValue("categoryId", suggestion.categoryId, options);
-    }
-    setValue("tags", suggestion.tags.slice(0, PRODUCT_LIMITS.maxTags), options);
-    setValue("trackStock", suggestion.trackStock, options);
-    setValue(
-      "presentations",
-      suggestion.presentations.map((presentation) => ({
-        unit: toUnit(presentation.unit, unit),
-        factor: decimalToText(presentation.factor),
-        price: decimalToText(presentation.price),
-        barcode: presentation.barcode ?? "",
-      })),
-      options,
-    );
+    applyBarcodeSuggestion({ getValues, setValue }, suggestion);
     setSource({ id: suggestion.id, barcode });
   };
 
@@ -269,7 +264,8 @@ function ProductForm({ product }: { product?: ProductDetail }) {
                 `No se pudieron copiar ${failedImages === 1 ? "1 foto" : `${failedImages} fotos`}. Puedes subirlas desde la ficha.`,
               );
             }
-            router.replace(`/products/${id}`);
+            if (modal) modal.onCreated({ id, values: formValues });
+            else router.replace(`/products/${id}`);
           },
         },
       );
@@ -278,226 +274,208 @@ function ProductForm({ product }: { product?: ProductDetail }) {
 
   const submitLabel = isEdit ? "Guardar cambios" : "Crear producto";
 
-  return (
-    <div className="flex flex-col gap-6">
-      <CatalogBackLink
-        href={backHref}
-        label={product ? product.name : "Productos"}
-      />
+  const submitButton = (
+    <AppButton
+      form={FORM_ID}
+      isDisabled={isEdit && !isDirty}
+      isPending={mutation.isPending}
+      type="submit"
+    >
+      {submitLabel}
+    </AppButton>
+  );
 
-      <PageHeader
-        actions={
-          <>
-            <AppButton variant="tertiary" onPress={() => router.push(backHref)}>
-              Cancelar
-            </AppButton>
-            <AppButton
-              form={FORM_ID}
-              isDisabled={isEdit && !isDirty}
-              isPending={mutation.isPending}
-              type="submit"
-            >
-              {submitLabel}
-            </AppButton>
-          </>
-        }
-        description={
-          isEdit
-            ? "Actualiza la información, el precio o las formas de venta."
-            : "Solo necesitas el nombre y el precio; el resto puedes completarlo después."
-        }
-        title={isEdit ? "Editar producto" : "Nuevo producto"}
-      />
+  const form = (
+    <form
+      noValidate
+      className="grid items-start gap-6 lg:grid-cols-3"
+      id={FORM_ID}
+      onSubmit={onSubmit}
+    >
+      <div className="flex flex-col gap-6 lg:col-span-2">
+        {mutation.error ? (
+          <AppAlert
+            description={mutation.error.message}
+            status="danger"
+            title="No se pudo guardar el producto"
+          />
+        ) : null}
 
-      <form
-        noValidate
-        className="grid items-start gap-6 lg:grid-cols-3"
-        id={FORM_ID}
-        onSubmit={onSubmit}
-      >
-        <div className="flex flex-col gap-6 lg:col-span-2">
-          {mutation.error ? (
-            <AppAlert
-              description={mutation.error.message}
-              status="danger"
-              title="No se pudo guardar el producto"
+        <AppCard
+          description={
+            isEdit
+              ? undefined
+              : "Escanéalo o escríbelo: si otro negocio ya tiene el producto, podrás rellenar sus datos con un clic."
+          }
+          title="Códigos"
+        >
+          <div className="grid gap-4 sm:grid-cols-2">
+            <AppInput
+              autoFocus={!isEdit}
+              control={control}
+              icon={<BarcodeIcon size={16} />}
+              label="Código de barras"
+              name="barcode"
+              onEnter={isEdit ? undefined : () => setLookupCode(barcode)}
             />
-          ) : null}
+            <AppInput
+              control={control}
+              description="Tu referencia interna. No se puede repetir."
+              icon={<TagIcon size={16} />}
+              label="Referencia (SKU)"
+              name="sku"
+            />
+          </div>
+          {isEdit ? null : (
+            <BarcodeSuggestions
+              barcode={lookupCode === barcode ? lookupCode : ""}
+              selectedId={sourceId}
+              onClear={() => setSource(null)}
+              onSelect={applySuggestion}
+            />
+          )}
+        </AppCard>
 
-          <AppCard
-            description={
-              isEdit
-                ? undefined
-                : "Escanéalo o escríbelo: si otro negocio ya tiene el producto, podrás rellenar sus datos con un clic."
-            }
-            title="Códigos"
-          >
-            <div className="grid gap-4 sm:grid-cols-2">
-              <AppInput
-                autoFocus={!isEdit}
-                control={control}
-                icon={<BarcodeIcon size={16} />}
-                label="Código de barras"
-                name="barcode"
-                onEnter={isEdit ? undefined : () => setLookupCode(barcode)}
-              />
-              <AppInput
-                control={control}
-                description="Tu referencia interna. No se puede repetir."
-                icon={<TagIcon size={16} />}
-                label="Referencia (SKU)"
-                name="sku"
-              />
-            </div>
-            {isEdit ? null : (
-              <BarcodeSuggestions
-                barcode={lookupCode === barcode ? lookupCode : ""}
-                selectedId={sourceId}
-                onClear={() => setSource(null)}
-                onSelect={applySuggestion}
-              />
-            )}
-          </AppCard>
+        <AppCard title="Información básica">
+          <AppInput
+            isRequired
+            control={control}
+            label="Nombre"
+            name="name"
+            placeholder="Por ejemplo, Galletas de avena"
+          />
+          <AppTextarea
+            control={control}
+            description="Lo que verá tu equipo al elegirlo: características, tallas, condiciones…"
+            label="Descripción"
+            name="description"
+            rows={4}
+          />
+          <div className="grid gap-4 sm:grid-cols-2">
+            <AppAutocomplete
+              control={control}
+              label="Categoría"
+              name="categoryId"
+              options={[{ value: "none", label: "Sin categoría" }]}
+              placeholder="Sin categoría"
+              source={optionSources.productCategories}
+            />
+            <AppTagInput
+              control={control}
+              label="Etiquetas"
+              maxLength={PRODUCT_LIMITS.maxTagLength}
+              maxTags={PRODUCT_LIMITS.maxTags}
+              name="tags"
+              source={optionSources.productTags}
+            />
+          </div>
+        </AppCard>
 
-          <AppCard title="Información básica">
+        <AppCard
+          description={`Importes en ${money.currency}, sin impuestos.`}
+          title="Precio"
+        >
+          <div className="grid gap-4 sm:grid-cols-2">
             <AppInput
               isRequired
               control={control}
-              label="Nombre"
-              name="name"
-              placeholder="Por ejemplo, Galletas de avena"
+              inputMode="decimal"
+              label="Precio de venta"
+              name="price"
+              placeholder="0,00"
             />
-            <AppTextarea
+            <AppAutocomplete
+              isRequired
               control={control}
-              description="Lo que verá tu equipo al elegirlo: características, tallas, condiciones…"
-              label="Descripción"
-              name="description"
-              rows={4}
+              label="Unidad base"
+              name="unit"
+              options={PRODUCT_UNITS.map((unit) => ({
+                value: unit.code,
+                label: unit.label,
+              }))}
             />
-            <div className="grid gap-4 sm:grid-cols-2">
-              <AppAutocomplete
-                control={control}
-                label="Categoría"
-                name="categoryId"
-                options={[{ value: "none", label: "Sin categoría" }]}
-                placeholder="Sin categoría"
-                source={optionSources.productCategories}
-              />
-              <AppTagInput
-                control={control}
-                label="Etiquetas"
-                maxLength={PRODUCT_LIMITS.maxTagLength}
-                maxTags={PRODUCT_LIMITS.maxTags}
-                name="tags"
-                source={optionSources.productTags}
-              />
-            </div>
-          </AppCard>
-
-          <AppCard
-            description={`Importes en ${money.currency}, sin impuestos.`}
-            title="Precio"
-          >
-            <div className="grid gap-4 sm:grid-cols-2">
-              <AppInput
-                isRequired
-                control={control}
-                inputMode="decimal"
-                label="Precio de venta"
-                name="price"
-                placeholder="0,00"
-              />
-              <AppAutocomplete
-                isRequired
-                control={control}
-                label="Unidad base"
-                name="unit"
-                options={PRODUCT_UNITS.map((unit) => ({
-                  value: unit.code,
-                  label: unit.label,
-                }))}
-              />
-              <AppInput
-                control={control}
-                description="IVA u otro impuesto, en %."
-                inputMode="decimal"
-                label="Impuesto"
-                name="taxRate"
-                placeholder="21"
-              />
-              <AppInput
-                control={control}
-                description="Lo que te cuesta a ti. Solo lo ve tu equipo."
-                inputMode="decimal"
-                label="Coste"
-                name="cost"
-                placeholder="0,00"
-              />
-            </div>
-            <PricePreview
-              cost={parseTypedDecimal(cost)}
-              price={parseTypedDecimal(price)}
-              taxRate={parseTypedDecimal(taxRate)}
-            />
-          </AppCard>
-
-          <AppCard
-            description="Formatos con varias unidades y su propio precio, como un paquete o una caja."
-            title="Formas de venta"
-          >
-            <ProductPresentationsField control={control} />
-          </AppCard>
-
-          <AppCard title="Inventario">
-            <AppSwitch
+            <AppInput
               control={control}
-              description="Lleva la cuenta de las unidades disponibles y recibe avisos de stock bajo."
-              label="Controlar stock"
-              name="trackStock"
+              description="IVA u otro impuesto, en %."
+              inputMode="decimal"
+              label="Impuesto"
+              name="taxRate"
+              placeholder="21"
             />
-            {trackStock ? (
-              <div className="grid gap-4 sm:grid-cols-2">
-                {isEdit ? null : (
-                  <AppInput
-                    control={control}
-                    description="Unidades que tienes ahora."
-                    inputMode="decimal"
-                    label="Stock inicial"
-                    name="initialStock"
-                    placeholder="0"
-                  />
-                )}
+            <AppInput
+              control={control}
+              description="Lo que te cuesta a ti. Solo lo ve tu equipo."
+              inputMode="decimal"
+              label="Coste"
+              name="cost"
+              placeholder="0,00"
+            />
+          </div>
+          <PricePreview
+            cost={parseTypedDecimal(cost)}
+            price={parseTypedDecimal(price)}
+            taxRate={parseTypedDecimal(taxRate)}
+          />
+        </AppCard>
+
+        <AppCard
+          description="Formatos con varias unidades y su propio precio, como un paquete o una caja."
+          title="Formas de venta"
+        >
+          <ProductPresentationsField control={control} />
+        </AppCard>
+
+        <AppCard title="Inventario">
+          <AppSwitch
+            control={control}
+            description="Lleva la cuenta de las unidades disponibles y recibe avisos de stock bajo."
+            label="Controlar stock"
+            name="trackStock"
+          />
+          {trackStock ? (
+            <div className="grid gap-4 sm:grid-cols-2">
+              {isEdit ? null : (
                 <AppInput
                   control={control}
-                  description="Te avisaremos al llegar a esta cantidad."
+                  description="Unidades que tienes ahora."
                   inputMode="decimal"
-                  label="Stock mínimo"
-                  name="minStock"
-                  placeholder="Opcional"
+                  label="Stock inicial"
+                  name="initialStock"
+                  placeholder="0"
                 />
-              </div>
-            ) : null}
-            {isEdit && trackStock ? (
-              <p className="text-xs text-muted">
-                Para cambiar las unidades disponibles usa «Ajustar stock» en la
-                ficha del producto; así queda registrado en el historial.
-              </p>
-            ) : null}
-          </AppCard>
-        </div>
+              )}
+              <AppInput
+                control={control}
+                description="Te avisaremos al llegar a esta cantidad."
+                inputMode="decimal"
+                label="Stock mínimo"
+                name="minStock"
+                placeholder="Opcional"
+              />
+            </div>
+          ) : null}
+          {isEdit && trackStock ? (
+            <p className="text-xs text-muted">
+              Para cambiar las unidades disponibles usa «Ajustar stock» en la
+              ficha del producto; así queda registrado en el historial.
+            </p>
+          ) : null}
+        </AppCard>
+      </div>
 
-        <aside className="flex flex-col gap-6 lg:sticky lg:top-6">
-          <AppCard title="Resumen">
-            <ProductSummary values={values} />
-          </AppCard>
-          <AppCard title="Disponibilidad">
-            <AppSwitch
-              control={control}
-              description="Los productos inactivos se conservan, pero dejan de ofrecerse."
-              label="Producto activo"
-              name="isActive"
-            />
-          </AppCard>
+      <aside className="flex flex-col gap-6 lg:sticky lg:top-6">
+        <AppCard title="Resumen">
+          <ProductSummary values={values} />
+        </AppCard>
+        <AppCard title="Disponibilidad">
+          <AppSwitch
+            control={control}
+            description="Los productos inactivos se conservan, pero dejan de ofrecerse."
+            label="Producto activo"
+            name="isActive"
+          />
+        </AppCard>
+        {modal ? null : (
           <div className="flex flex-col gap-2">
             <AppButton
               fullWidth
@@ -514,8 +492,58 @@ function ProductForm({ product }: { product?: ProductDetail }) {
               </p>
             ) : null}
           </div>
-        </aside>
-      </form>
+        )}
+      </aside>
+    </form>
+  );
+
+  if (modal) {
+    return (
+      <AppModal
+        isOpen
+        description="Solo necesitas el nombre y el precio; el resto puedes completarlo después."
+        footer={
+          <>
+            <AppButton variant="tertiary" onPress={modal.onClose}>
+              Cancelar
+            </AppButton>
+            {submitButton}
+          </>
+        }
+        size="xl"
+        title="Nuevo producto"
+        onOpenChange={(isOpen) => !isOpen && modal.onClose()}
+      >
+        {form}
+      </AppModal>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-6">
+      <CatalogBackLink
+        href={backHref}
+        label={product ? product.name : "Productos"}
+      />
+
+      <PageHeader
+        actions={
+          <>
+            <AppButton variant="tertiary" onPress={() => router.push(backHref)}>
+              Cancelar
+            </AppButton>
+            {submitButton}
+          </>
+        }
+        description={
+          isEdit
+            ? "Actualiza la información, el precio o las formas de venta."
+            : "Solo necesitas el nombre y el precio; el resto puedes completarlo después."
+        }
+        title={isEdit ? "Editar producto" : "Nuevo producto"}
+      />
+
+      {form}
     </div>
   );
 }
@@ -536,6 +564,14 @@ export function ProductCreateView() {
     );
 
   return <ProductForm />;
+}
+
+/**
+ * The same form as /products/new in a large modal, to create a product
+ * without leaving the current screen (e.g. the till).
+ */
+export function ProductCreateModal(props: ProductFormModal) {
+  return <ProductForm modal={props} />;
 }
 
 export function ProductEditView({ id }: { id: string }) {

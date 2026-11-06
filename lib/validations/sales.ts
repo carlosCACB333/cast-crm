@@ -194,6 +194,7 @@ export const salesSettingsSchema = z.object({
   invoiceDueDays: daysField,
   defaultTerms: optionalText(SALES_LIMITS.maxTermsLength),
   stockOnDelivery: z.boolean(),
+  allowNegativeStock: z.boolean(),
 });
 
 export const salesDocumentIdSchema = idField;

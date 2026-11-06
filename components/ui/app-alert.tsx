@@ -1,7 +1,7 @@
 import { Alert } from "@heroui/react";
 
 export interface AppAlertProps {
-  status: "danger" | "success" | "accent";
+  status: "danger" | "warning" | "success" | "accent";
   title: string;
   description?: React.ReactNode;
 }

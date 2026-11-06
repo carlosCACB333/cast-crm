@@ -326,6 +326,7 @@ export const DEFAULT_SALES_SETTINGS = {
   defaultTaxRate: null as number | null,
   defaultTerms: null as string | null,
   stockOnDelivery: true,
+  allowNegativeStock: false,
 };
 
 export const SALES_LIMITS = {

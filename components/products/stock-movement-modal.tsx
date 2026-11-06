@@ -33,10 +33,13 @@ const FORM_ID = "stock-movement-form";
 export function StockMovementModal({
   isOpen,
   onOpenChange,
+  onSaved,
   product,
 }: {
   isOpen: boolean;
   onOpenChange: (isOpen: boolean) => void;
+  /** Called once the movement is saved, before the modal closes. */
+  onSaved?: () => void;
   product: Pick<
     ProductDetail,
     "id" | "name" | "stock" | "unit" | "presentations"
@@ -44,7 +47,8 @@ export function StockMovementModal({
 }) {
   const add = useActionMutation(addStockMovement, {
     successMessage: "Stock actualizado",
-    invalidate: [queryKeys.products],
+    // The till shows the stock of its catalog too.
+    invalidate: [queryKeys.products, queryKeys.pos],
   });
   const empty: StockMovementValues = {
     productId: product.id,
@@ -83,7 +87,12 @@ export function StockMovementModal({
         : typed;
 
   const onSubmit = handleSubmit((values) =>
-    add.mutate(values, { onSuccess: () => onOpenChange(false) }),
+    add.mutate(values, {
+      onSuccess: () => {
+        onSaved?.();
+        onOpenChange(false);
+      },
+    }),
   );
 
   return (

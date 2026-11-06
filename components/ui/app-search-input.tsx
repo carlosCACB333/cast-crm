@@ -12,6 +12,11 @@ export interface AppSearchInputProps {
   className?: string;
   /** Waits this long after the last keystroke before calling `onChange`. */
   debounceMs?: number;
+  /**
+   * Changing it puts the box back to `value` even if `value` looks the same,
+   * e.g. a search that is cleared right after being made (a scanned code).
+   */
+  resetKey?: number;
 }
 
 /** Search box for lists. The label is visually hidden. */
@@ -22,9 +27,17 @@ export function AppSearchInput({
   placeholder,
   className,
   debounceMs = 0,
+  resetKey = 0,
 }: AppSearchInputProps) {
   const [draft, setDraft] = useState(value);
   const [syncedValue, setSyncedValue] = useState(value);
+  const [syncedResetKey, setSyncedResetKey] = useState(resetKey);
+
+  if (resetKey !== syncedResetKey) {
+    setSyncedResetKey(resetKey);
+    setSyncedValue(value);
+    setDraft(value);
+  }
 
   // Follow external changes (e.g. "clear filters" or back navigation).
   if (value !== syncedValue) {

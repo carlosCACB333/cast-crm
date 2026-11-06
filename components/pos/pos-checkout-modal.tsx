@@ -7,6 +7,7 @@ import type {
 } from "@/lib/validations/pos";
 
 import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useFieldArray, useForm, useWatch } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import clsx from "clsx";
@@ -24,8 +25,12 @@ import {
   AppInput,
   AppModal,
 } from "@/components/ui";
+import {
+  PosStockAdjustModal,
+  PosStockShortageList,
+} from "@/components/pos/pos-stock-shortages";
 import { POS_LIMITS } from "@/config/pos";
-import { useActionMutation } from "@/hooks/use-action-mutation";
+import { ActionError, useActionMutation } from "@/hooks/use-action-mutation";
 import { useMoneyFormatter } from "@/hooks/use-preferences";
 import { createPosTicket } from "@/lib/actions/pos";
 import { decimalToText } from "@/lib/pricing";
@@ -114,6 +119,9 @@ export function PosCheckoutModal({
   onSold: () => void;
 }) {
   const money = useMoneyFormatter();
+  const queryClient = useQueryClient();
+  // Product whose stock is being adjusted on top of the checkout.
+  const [adjustingProductId, setAdjustingProductId] = useState<string>();
   const [ticket, setTicket] = useState<{
     id: string;
     number: string;
@@ -182,8 +190,20 @@ export function PosCheckoutModal({
 
       return;
     }
-    sell.mutate({ ...cart, ...values }, { onSuccess: setTicket });
+    sell.mutate(
+      { ...cart, ...values },
+      {
+        onSuccess: setTicket,
+        // The warning of the cart catches up with the stock the sale found.
+        onError: () =>
+          queryClient.invalidateQueries({
+            queryKey: queryKeys.posStockChecks,
+          }),
+      },
+    );
   });
+  const shortages =
+    sell.error instanceof ActionError ? sell.error.stockShortages : undefined;
 
   const close = () => {
     if (ticket) onSold();
@@ -231,7 +251,24 @@ export function PosCheckoutModal({
           id={FORM_ID}
           onSubmit={onSubmit}
         >
-          {sell.error || errors.root ? (
+          {shortages?.length ? (
+            <AppAlert
+              description={
+                <div className="flex flex-col gap-2">
+                  <span>
+                    No se ha cobrado nada. Ajusta su stock o cambia el ticket y
+                    vuelve a cobrar.
+                  </span>
+                  <PosStockShortageList
+                    shortages={shortages}
+                    onAdjust={setAdjustingProductId}
+                  />
+                </div>
+              }
+              status="danger"
+              title="Stock insuficiente"
+            />
+          ) : sell.error || errors.root ? (
             <AppAlert
               description={sell.error?.message ?? errors.root?.message}
               status="danger"
@@ -364,6 +401,15 @@ export function PosCheckoutModal({
           </dl>
         </form>
       )}
+      {/* Rendered inside the checkout, outside its form, so it opens on top. */}
+      {adjustingProductId ? (
+        <PosStockAdjustModal
+          productId={adjustingProductId}
+          onClose={() => setAdjustingProductId(undefined)}
+          // The shortage may be fixed: charging again checks it anew.
+          onSaved={() => sell.reset()}
+        />
+      ) : null}
     </AppModal>
   );
 }

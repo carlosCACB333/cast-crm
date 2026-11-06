@@ -12,6 +12,10 @@ import type {
 
 import { APIError } from "better-auth/api";
 
+import {
+  InsufficientStockError,
+  type StockShortage,
+} from "@/lib/actions/result";
 import { presentationLabel } from "@/config/products";
 import { SALES_LIMITS, SALES_TYPES } from "@/config/sales";
 import { Prisma } from "@/lib/generated/prisma/client";
@@ -344,6 +348,7 @@ export async function getSalesSettings(organizationId: string) {
       totalTaxRate: true,
       salesDefaultTerms: true,
       salesStockOnDelivery: true,
+      salesAllowNegativeStock: true,
     },
   });
 
@@ -361,6 +366,7 @@ export async function getSalesSettings(organizationId: string) {
     totalTax: organizationTotalTax(organization),
     defaultTerms: organization.salesDefaultTerms,
     stockOnDelivery: organization.salesStockOnDelivery,
+    allowNegativeStock: organization.salesAllowNegativeStock,
   };
 }
 
@@ -626,10 +632,126 @@ export async function resolveOwner(organizationId: string, ownerId: string) {
   return ownerId;
 }
 
+/** Adds up the base units of each product: a pack of 12 counts 12 per pack. */
+function baseQuantities(
+  lines: {
+    productId: string | null;
+    quantity: Prisma.Decimal;
+    unitFactor: Prisma.Decimal | number;
+  }[],
+) {
+  const quantities = new Map<string, Prisma.Decimal>();
+
+  for (const line of lines) {
+    if (!line.productId) continue;
+    quantities.set(
+      line.productId,
+      (quantities.get(line.productId) ?? new Prisma.Decimal(0)).plus(
+        line.quantity.times(line.unitFactor),
+      ),
+    );
+  }
+
+  return quantities;
+}
+
+/** Products whose stock does not cover the base units taken out of them. */
+function stockShortages(
+  products: {
+    id: string;
+    name: string;
+    unit: string;
+    stock: Prisma.Decimal;
+  }[],
+  quantities: Map<string, Prisma.Decimal>,
+): StockShortage[] {
+  return products.flatMap((product) => {
+    const requested = quantities.get(product.id);
+
+    return requested && product.stock.lt(requested)
+      ? [
+          {
+            productId: product.id,
+            name: product.name,
+            unit: product.unit,
+            requested: requested.toNumber(),
+            available: product.stock.toNumber(),
+          },
+        ]
+      : [];
+  });
+}
+
+/**
+ * Products of a cart (sales lines not saved yet) whose tracked stock does not
+ * cover it, to warn before charging. The sale validates it again.
+ */
+export async function findCartStockShortages(
+  organizationId: string,
+  lines: { itemRef: string; presentationId: string; quantity: string }[],
+) {
+  const sold = lines.flatMap((line) => {
+    const [kind, productId] = line.itemRef.split(":");
+    const quantity = toDecimal(line.quantity);
+
+    return kind === "product" && productId && quantity
+      ? [
+          {
+            productId,
+            presentationId:
+              line.presentationId &&
+              line.presentationId !== SALES_BASE_PRESENTATION
+                ? line.presentationId
+                : null,
+            quantity: new Prisma.Decimal(quantity),
+          },
+        ]
+      : [];
+  });
+  const presentationIds = sold.flatMap((line) =>
+    line.presentationId ? [line.presentationId] : [],
+  );
+  const [products, presentations] = await prisma.$transaction([
+    prisma.product.findMany({
+      where: {
+        organizationId,
+        id: { in: sold.map((line) => line.productId) },
+        trackStock: true,
+      },
+      select: { id: true, name: true, unit: true, stock: true },
+    }),
+    prisma.productPresentation.findMany({
+      where: { organizationId, id: { in: presentationIds } },
+      select: { id: true, productId: true, factor: true },
+    }),
+  ]);
+  const presentationById = new Map(
+    presentations.map((item) => [item.id, item]),
+  );
+  const quantities = baseQuantities(
+    sold.map((line) => {
+      const presentation = line.presentationId
+        ? presentationById.get(line.presentationId)
+        : undefined;
+
+      return {
+        productId: line.productId,
+        quantity: line.quantity,
+        // A presentation of another product is ignored; the sale rejects it.
+        unitFactor:
+          presentation?.productId === line.productId ? presentation.factor : 1,
+      };
+    }),
+  );
+
+  return stockShortages(products, quantities);
+}
+
 /**
  * Takes the units of a delivery note (or ticket) out of the stock of its
  * tracked products (`direction: "out"`), or puts them back when the delivery
- * is cancelled.
+ * is cancelled. Unless the organization allows negative stock, a delivery
+ * that leaves any product below zero fails listing every product short.
  */
 export async function applyDeliveryStock(
   tx: Tx,
@@ -639,6 +761,7 @@ export async function applyDeliveryStock(
     number,
     authorId,
     direction,
+    allowNegativeStock = false,
     reason: customReason,
   }: {
     organizationId: string;
@@ -646,6 +769,8 @@ export async function applyDeliveryStock(
     number: string | null;
     authorId: string;
     direction: "out" | "in";
+    /** The organization lets stock go below zero (sales settings). */
+    allowNegativeStock?: boolean;
     /** Overrides the default movement reason ("Albarán …"). */
     reason?: string;
   },
@@ -655,27 +780,22 @@ export async function applyDeliveryStock(
     select: { productId: true, quantity: true, unitFactor: true },
   });
   // Stock is kept in base units: a pack of 12 takes out 12 per pack sold.
-  const quantities = new Map<string, Prisma.Decimal>();
-
-  for (const line of lines) {
-    const id = line.productId as string;
-
-    quantities.set(
-      id,
-      (quantities.get(id) ?? new Prisma.Decimal(0)).plus(
-        line.quantity.times(line.unitFactor),
-      ),
-    );
-  }
-
+  const quantities = baseQuantities(lines);
   const products = await tx.product.findMany({
     where: {
       organizationId,
       id: { in: [...quantities.keys()] },
       trackStock: true,
     },
-    select: { id: true, stock: true },
+    select: { id: true, name: true, unit: true, stock: true },
   });
+
+  if (direction === "out" && !allowNegativeStock) {
+    const shortages = stockShortages(products, quantities);
+
+    if (shortages.length) throw new InsufficientStockError(shortages);
+  }
+
   const reason =
     customReason ??
     (direction === "out"
@@ -686,10 +806,6 @@ export async function applyDeliveryStock(
     const amount = quantities.get(product.id) as Prisma.Decimal;
     const delta = direction === "out" ? amount.negated() : amount;
     const stockAfter = product.stock.plus(delta);
-
-    if (stockAfter.isNegative()) {
-      throw new APIError("BAD_REQUEST", { code: "SALES_INSUFFICIENT_STOCK" });
-    }
 
     // Only applies if nobody changed the stock since it was read.
     const { count } = await tx.product.updateMany({

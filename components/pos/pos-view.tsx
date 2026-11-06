@@ -53,6 +53,7 @@ import {
   AppChip,
   AppDropdown,
   AppEmptyState,
+  AppIconLink,
   AppInput,
   AppLink,
   AppTooltip,
@@ -65,7 +66,7 @@ import {
   useMyAccess,
   usePermission,
 } from "@/hooks/use-organization";
-import { usePosState } from "@/hooks/use-pos";
+import { usePosState, usePosStockCheck } from "@/hooks/use-pos";
 import { useMoneyFormatter } from "@/hooks/use-preferences";
 import { openCashSession } from "@/lib/actions/pos";
 import { formatRelative } from "@/lib/format";
@@ -246,6 +247,7 @@ function PosTerminal({ state }: { state: PosState }) {
     handleSubmit,
     reset,
     setValue,
+    getValues,
     formState: { errors },
   } = useForm<PosCartValues>({
     resolver: zodResolver(posCartSchema),
@@ -263,9 +265,29 @@ function PosTerminal({ state }: { state: PosState }) {
   // Same totals the server will charge, with the tax on the total if active.
   const totals = documentTotals(numbers, settings.totalTax?.rate);
   const units = numbers.reduce((sum, line) => sum + line.quantity, 0);
+  // Only when the sale takes the units out of the stock.
+  const stockCheck = usePosStockCheck(
+    settings.stockOnSale
+      ? lines.flatMap((line, index) =>
+          line?.itemRef?.startsWith("product:") && numbers[index].quantity > 0
+            ? [
+                {
+                  itemRef: line.itemRef,
+                  presentationId: line.presentationId ?? "",
+                  quantity: line.quantity,
+                },
+              ]
+            : [],
+        )
+      : [],
+  );
+  const shortages = fields.length ? (stockCheck.data ?? []) : [];
+  const shortProductIds = new Set(shortages.map((item) => item.productId));
 
   /** Adds one unit of the item in the chosen presentation ("" or "base"). */
   const addItem = (item: PosItem, presentationId: string) => {
+    // The current cart, not the last render's: scans can arrive in a burst.
+    const lines = getValues("lines");
     const index = lines.findIndex(
       (line) =>
         line?.itemRef === item.ref && line.presentationId === presentationId,
@@ -513,6 +535,9 @@ function PosTerminal({ state }: { state: PosState }) {
                   Boolean(line) &&
                   listPrice !== undefined &&
                   typedNumber(listPrice) !== line.unitPrice;
+                const isShort = shortProductIds.has(
+                  lines[index]?.itemRef?.split(":")[1] ?? "",
+                );
                 // Lines with an invalid value stay open so the error is visible.
                 const isEditing =
                   editing === field.id || Boolean(errors.lines?.[index]);
@@ -520,19 +545,20 @@ function PosTerminal({ state }: { state: PosState }) {
                 return (
                   <li key={field.id} className="flex flex-col gap-2 py-3">
                     <div className="flex items-start justify-between gap-2">
-                      {itemHref ? (
-                        <AppLink
-                          newTab
-                          className="min-w-0 leading-snug text-foreground"
-                          href={itemHref}
-                        >
-                          {lines[index]?.description}
-                        </AppLink>
-                      ) : (
+                      <div className="flex min-w-0 flex-wrap items-center gap-1">
                         <span className="min-w-0 text-sm font-medium leading-snug">
                           {lines[index]?.description}
                         </span>
-                      )}
+                        {itemHref ? (
+                          <AppIconLink
+                            href={itemHref}
+                            label={`Ver ficha de ${description}`}
+                          />
+                        ) : null}
+                        {isShort ? (
+                          <AppChip color="warning">Stock insuficiente</AppChip>
+                        ) : null}
+                      </div>
                       <span className="shrink-0 font-semibold tabular-nums">
                         {money.format(amount)}
                       </span>
