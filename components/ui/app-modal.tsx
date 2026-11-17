@@ -45,7 +45,9 @@ export function AppModal({
             ) : null}
           </Modal.Header>
           {children ? (
-            <Modal.Body className="flex flex-col gap-4">{children}</Modal.Body>
+            <Modal.Body className="flex flex-col gap-4 overflow-x-hidden">
+              {children}
+            </Modal.Body>
           ) : null}
           {footer ? (
             <Modal.Footer className="flex justify-end gap-2">
